@@ -1,0 +1,30 @@
+[project]
+name = "FastLSTM"
+version = "0.1.0"
+description = "A fast LSTM implementation in Triton"
+readme = "README.md"
+requires-python = ">=3.12.0"
+authors = [
+    { name = "Oliver Leicht", email = "oliverleicht@gmx.de" }
+]
+dependencies = [
+    "ipython>=9.6.0",
+    "jaxtyping>=0.3.3",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.7",
+    "numpy>=2.3.4",
+    "pandas>=2.3.3",
+    "plotly>=6.3.1",
+    "pyarrow>=22.0.0",
+    "pytest>=8.4.2",
+    "torch>=2.9.1",
+    "tqdm>=4.67.1",
+    "triton>=3.5.1",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
