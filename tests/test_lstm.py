@@ -9,6 +9,7 @@ from fastlstm.lstm import (
     lstm_v1_fwd,
     naive_lstm_cell_bwd,
     FastLSTM,
+    FlashLSTM
 )
 
 
@@ -219,3 +220,26 @@ def test_fastlstm(version, seq_size, batch_size, hidden_size):
             * 10,
             rtol=0.03,
         )
+
+def test_flashlstm_fwd(hidden_size=256, batch_size=16, seq_len=1024):
+    if not DEVICE == "cuda":
+        pytest.skip("No gpu detected - test skipped")
+
+    torch.manual_seed(123)
+    lstm_t = nn.LSTM(
+        input_size=hidden_size,
+        hidden_size=hidden_size,
+        device="cuda",
+        dtype=torch.float16,
+        )
+
+    lstm_f = FlashLSTM(hidden_size, hidden_size, dtype=torch.float16, backend="cuda")
+    lstm_f.b.data.copy_((lstm_t.bias_ih_l0+lstm_t.bias_hh_l0).reshape(4, 1, hidden_size))
+    lstm_f.R.data.copy_((lstm_t.weight_hh_l0).reshape(4, 1, hidden_size, hidden_size))
+    lstm_f.gate_in.weight.data.copy_(lstm_t.weight_ih_l0)
+
+    x = torch.randn((seq_len, batch_size, hidden_size), device="cuda", dtype=torch.float16)
+    o1 = lstm_f(x)
+    o2 = lstm_t(x)
+
+    torch.testing.assert_close(o1[0], o2[0], atol=1e-3, rtol=0)

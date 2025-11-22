@@ -815,6 +815,44 @@ class FastLSTM(nn.Module):
         return x, (torch.stack(h_n), torch.stack(c_n))
 
 
+class FlashLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, backend, dtype=None, device="cuda"):
+        super().__init__()
+        self.gate_in = nn.Linear(input_size, 4 * hidden_size, dtype=dtype, device=device, bias=False)
+        sqrt_k_inv = 1 / hidden_size**0.5
+        self.R = nn.Parameter(torch.randn([4, 1, hidden_size, hidden_size], device=device, dtype=dtype)* 2
+                    * sqrt_k_inv
+                    - sqrt_k_inv)
+        self.b = nn.Parameter(torch.randn([4, 1, hidden_size], device=device, dtype=dtype)* 2
+                    * sqrt_k_inv
+                    - sqrt_k_inv)
+        self.hidden_size = hidden_size
+        self.backend = backend
+        self.dtype = {torch.float16: "float16",
+                      torch.bfloat16: "bfloat16",
+                       torch.float32: "float32" }[dtype]
+
+    def forward(self, x):
+        from flashrnn import flashrnn
+        R = self.R
+        Wx = self.gate_in(x)
+        Wx = Wx.transpose(0,1)  # make it batch_first
+        Wx = Wx.reshape(
+                Wx.shape[0], Wx.shape[1], R.shape[0], R.shape[1], R.shape[2]
+            )
+
+        h_frnn, hlast_frnn = flashrnn(
+            Wx=Wx,
+            R=R,
+            b=self.b,
+            states=None,
+            function="lstm",
+            backend=self.backend,
+            dtype=self.dtype,
+            )
+
+        return h_frnn[0].transpose(0, 1).squeeze(-2), hlast_frnn
+
 #######################################################################################
 ################# versions below were experimental and aren't performant ##############
 #######################################################################################
