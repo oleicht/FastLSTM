@@ -5,9 +5,54 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 
+from itertools import product
+
+#######################################################################################
+
+def get_fwd_autotune_configs():
+    return [
+    triton.Config(
+            {
+                "BLOCK_SIZE_H": 8,
+                "BLOCK_SIZE_B": 8,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_B": 8,
+            },
+            num_warps=1,
+            num_stages=s,
+        ) for s in [4, 6, 8] ] + [
+
+        triton.Config(
+            {
+                "BLOCK_SIZE_H": 8,
+                "BLOCK_SIZE_B": 32,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_B": 8,
+            },
+            num_warps=2,
+            num_stages=6,
+        ),
+
+        triton.Config(
+            {
+                "BLOCK_SIZE_H": 32,
+                "BLOCK_SIZE_B": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_B": 8,
+            },
+            num_warps=4,
+            num_stages=6,
+        ),
+    ]
+
+
 #######################################################################################
 #################################### fwd kernels ######################################
 #######################################################################################
+@triton.autotune(
+    configs=get_fwd_autotune_configs(),
+    key=["batch_size", "hidden_size", "dtype"],
+)
 @triton.jit
 def one_step_fwd(
     ifgo_ptr,
@@ -130,7 +175,6 @@ def one_step_fwd(
     else:
         tl.store(cell_ptrs, c, mask=mask)
         tl.store(h_write_ptrs, h, mask=mask)
-
 
 @triton.jit
 def persistent_fwd_kernel(

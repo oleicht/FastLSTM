@@ -1,3 +1,4 @@
+from collections import defaultdict
 from functools import partial
 
 import torch
@@ -5,7 +6,7 @@ import torch.nn as nn
 import triton
 
 import fastlstm.kernels as kernels
-
+from flashrnn import flashrnn
 
 torch.backends.fp32_precision = "tf32"
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -13,6 +14,8 @@ torch.backends.cudnn.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
 torch.backends.cudnn.rnn.fp32_precision = "tf32"
 
+TRACK_AUTOTUNE_RUNTIMES = False
+CONFIG_RES = defaultdict(list)
 
 dtype_str = {
     torch.float32: "fp32",
@@ -55,18 +58,27 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("kernel setup")
     if triton_config is None:
-        BLOCK_SIZE_H = 8
+        # RTX 2000 Ada
+        # BLOCK_SIZE_H = 8
+        # BLOCK_SIZE_B = 32
+        # BLOCK_SIZE_K = 32
+        # GROUP_SIZE_B = 8
+        # num_warps = 2
+
+        # if hidden_size <= 256:
+        #     num_stages = 6
+        # elif hidden_size <= 512:
+        #     num_stages = 4
+        # else:
+        #     num_stages = 2
+
+        # H100
+        BLOCK_SIZE_H = 32
         BLOCK_SIZE_B = 32
         BLOCK_SIZE_K = 32
         GROUP_SIZE_B = 8
         num_warps = 2
-
-        if hidden_size <= 256:
-            num_stages = 6
-        elif hidden_size <= 512:
-            num_stages = 4
-        else:
-            num_stages = 2
+        num_stages = 6
 
     else:
         BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
@@ -164,15 +176,25 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("triton_start")
     if triton_config is None:
-        BLOCK_SIZE_H = 8
-        BLOCK_SIZE_B = 32
-        BLOCK_SIZE_K = 32
-        GROUP_SIZE_B = 8
-        num_warps = 2
-        num_stages = 1
+        # RTX 2000 Ada
+        # BLOCK_SIZE_H = 8
+        # BLOCK_SIZE_B = 32
+        # BLOCK_SIZE_K = 32
+        # GROUP_SIZE_B = 8
+        # num_warps = 2
+        # num_stages = 1
 
-        if batch_size > 32:
-            BLOCK_SIZE_B = 64
+        # if batch_size > 32:
+        #     BLOCK_SIZE_B = 64
+
+        # H100
+        BLOCK_SIZE_H = 32
+        BLOCK_SIZE_B = 64
+        BLOCK_SIZE_K = 64
+        GROUP_SIZE_B = 8
+        num_warps = 4
+        num_stages = 6
+
 
     else:
         BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
@@ -182,8 +204,11 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
         num_warps = triton_config["num_warps"]
         num_stages = triton_config["num_stages"]
 
-    grid = (
-        triton.cdiv(batch_size, BLOCK_SIZE_B) * triton.cdiv(hidden_size, BLOCK_SIZE_H),
+    # grid = (
+    #     triton.cdiv(batch_size, BLOCK_SIZE_B) * triton.cdiv(hidden_size, BLOCK_SIZE_H),
+    # )
+    grid = lambda META: (
+        triton.cdiv(batch_size, META["BLOCK_SIZE_B"]) * triton.cdiv(hidden_size, META["BLOCK_SIZE_H"]),
     )
 
     torch.cuda.nvtx.range_pop()
@@ -199,14 +224,17 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
         offset_ptr=offset,
         batch_size=batch_size,
         hidden_size=hidden_size,
-        BLOCK_SIZE_B=BLOCK_SIZE_B,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        BLOCK_SIZE_H=BLOCK_SIZE_H,
-        GROUP_SIZE_B=GROUP_SIZE_B,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        # BLOCK_SIZE_B=BLOCK_SIZE_B,
+        # BLOCK_SIZE_K=BLOCK_SIZE_K,
+        # BLOCK_SIZE_H=BLOCK_SIZE_H,
+        # GROUP_SIZE_B=GROUP_SIZE_B,
+        # num_warps=num_warps,
+        # num_stages=num_stages,
         dtype=dtype_str[ifgo.dtype],
     )
+    if TRACK_AUTOTUNE_RUNTIMES:
+        for k, v in kernels.one_step_fwd.configs_timings.items():
+            CONFIG_RES[f"graph-h{hidden_size}-b{batch_size}"] += [(str(k), v)]
     torch.cuda.nvtx.range_pop()
 
     if seq_len > 1:
@@ -222,12 +250,12 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
                 offset_ptr=offset,
                 batch_size=batch_size,
                 hidden_size=hidden_size,
-                BLOCK_SIZE_B=BLOCK_SIZE_B,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                BLOCK_SIZE_H=BLOCK_SIZE_H,
-                GROUP_SIZE_B=GROUP_SIZE_B,
-                num_warps=num_warps,
-                num_stages=num_stages,
+                # BLOCK_SIZE_B=BLOCK_SIZE_B,
+                # BLOCK_SIZE_K=BLOCK_SIZE_K,
+                # BLOCK_SIZE_H=BLOCK_SIZE_H,
+                # GROUP_SIZE_B=GROUP_SIZE_B,
+                # num_warps=num_warps,
+                # num_stages=num_stages,
                 dtype=dtype_str[ifgo.dtype],
             )
         torch.cuda.nvtx.range_pop()
@@ -833,10 +861,9 @@ class FlashLSTM(nn.Module):
                        torch.float32: "float32" }[dtype]
 
     def forward(self, x):
-        from flashrnn import flashrnn
         R = self.R
-        Wx = self.gate_in(x)
-        Wx = Wx.transpose(0,1)  # make it batch_first
+        # convert to batch_first
+        Wx = self.gate_in(x.transpose(0,1))
         Wx = Wx.reshape(
                 Wx.shape[0], Wx.shape[1], R.shape[0], R.shape[1], R.shape[2]
             )
