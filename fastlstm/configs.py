@@ -1,5 +1,3 @@
-from functools import partial
-
 import torch
 import triton
 
@@ -50,11 +48,13 @@ def persistent_layout(hidden_size, BLOCK_SIZE_H, batch_size, BLOCK_SIZE_B):
             "num_pid_b": num_pid_b
             }
 
+
 def compute_persistent_grid_dim(kwargs):
     num_pid_b = kwargs["num_pid_b"]
     num_pid_h = triton.cdiv(kwargs["hidden_size"], kwargs["BLOCK_SIZE_H"])
     assert num_pid_b * num_pid_h  < torch.cuda.get_device_properties("cuda").multi_processor_count
     return (num_pid_b * num_pid_h, )
+
 
 def get_persistent_fwd_autotune_configs():
     """
@@ -70,10 +70,11 @@ def get_persistent_fwd_autotune_configs():
                                   hidden_size=HIDDEN_SIZE,
                                   batch_size=BATCH_SIZE,
                                   BLOCK_SIZE_B=b),
-            num_warps=2,
+            num_warps=w,
             num_stages=s,
         )
-        for s in [2, 4, 6]
+        for w in [1, 2, 4]
+        for s in [2, 4, 6, 8]
         for h in [8, 16, 32]
         for b in [16, 32, 64]
         ]
