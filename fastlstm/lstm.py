@@ -59,26 +59,26 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     torch.cuda.nvtx.range_push("kernel setup")
     if triton_config is None:
         # RTX 2000 Ada
-        # BLOCK_SIZE_H = 8
-        # BLOCK_SIZE_B = 32
-        # BLOCK_SIZE_K = 32
-        # GROUP_SIZE_B = 8
-        # num_warps = 2
-
-        # if hidden_size <= 256:
-        #     num_stages = 6
-        # elif hidden_size <= 512:
-        #     num_stages = 4
-        # else:
-        #     num_stages = 2
-
-        # H100
-        BLOCK_SIZE_H = 32
+        BLOCK_SIZE_H = 8
         BLOCK_SIZE_B = 32
         BLOCK_SIZE_K = 32
         GROUP_SIZE_B = 8
         num_warps = 2
-        num_stages = 6
+
+        if hidden_size <= 256:
+            num_stages = 6
+        elif hidden_size <= 512:
+            num_stages = 4
+        else:
+            num_stages = 2
+
+        # H100
+        # BLOCK_SIZE_H = 32
+        # BLOCK_SIZE_B = 32
+        # BLOCK_SIZE_K = 32
+        # GROUP_SIZE_B = 8
+        # num_warps = 2
+        # num_stages = 6
 
     else:
         BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
@@ -175,38 +175,38 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("triton_start")
-    if triton_config is None:
-        # RTX 2000 Ada
-        # BLOCK_SIZE_H = 8
-        # BLOCK_SIZE_B = 32
-        # BLOCK_SIZE_K = 32
-        # GROUP_SIZE_B = 8
-        # num_warps = 2
-        # num_stages = 1
+    # if triton_config is None:
+    #     RTX 2000 Ada
+    #     BLOCK_SIZE_H = 8
+    #     BLOCK_SIZE_B = 32
+    #     BLOCK_SIZE_K = 32
+    #     GROUP_SIZE_B = 8
+    #     num_warps = 2
+    #     num_stages = 1
 
-        # if batch_size > 32:
-        #     BLOCK_SIZE_B = 64
+    #     if batch_size > 32:
+    #         BLOCK_SIZE_B = 64
 
-        # H100
-        BLOCK_SIZE_H = 32
-        BLOCK_SIZE_B = 64
-        BLOCK_SIZE_K = 64
-        GROUP_SIZE_B = 8
-        num_warps = 4
-        num_stages = 6
+    #     # H100
+    #     BLOCK_SIZE_H = 32
+    #     BLOCK_SIZE_B = 64
+    #     BLOCK_SIZE_K = 64
+    #     GROUP_SIZE_B = 8
+    #     num_warps = 4
+    #     num_stages = 6
 
 
-    else:
-        BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-        BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-        BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-        GROUP_SIZE_B = triton_config["GROUP_SIZE_B"]
-        num_warps = triton_config["num_warps"]
-        num_stages = triton_config["num_stages"]
-
+    # else:
+    #     BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
+    #     BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
+    #     BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
+    #     GROUP_SIZE_B = triton_config["GROUP_SIZE_B"]
+    #     num_warps = triton_config["num_warps"]
+    #     num_stages = triton_config["num_stages"]
     # grid = (
     #     triton.cdiv(batch_size, BLOCK_SIZE_B) * triton.cdiv(hidden_size, BLOCK_SIZE_H),
     # )
+
     grid = lambda META: (
         triton.cdiv(batch_size, META["BLOCK_SIZE_B"]) * triton.cdiv(hidden_size, META["BLOCK_SIZE_H"]),
     )
@@ -216,54 +216,56 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
 
     offset = torch.zeros((1,), device=x.device, dtype=torch.int)
     # warmup / compile
-    kernels.one_step_fwd[grid](
-        ifgo_ptr=ifgo,
-        cell_ptr=cell,
-        h_ptr=out,
-        W_h_ptr=Wh,
-        offset_ptr=offset,
-        batch_size=batch_size,
-        hidden_size=hidden_size,
-        # BLOCK_SIZE_B=BLOCK_SIZE_B,
-        # BLOCK_SIZE_K=BLOCK_SIZE_K,
-        # BLOCK_SIZE_H=BLOCK_SIZE_H,
-        # GROUP_SIZE_B=GROUP_SIZE_B,
-        # num_warps=num_warps,
-        # num_stages=num_stages,
-        dtype=dtype_str[ifgo.dtype],
-    )
-    if TRACK_AUTOTUNE_RUNTIMES:
-        for k, v in kernels.one_step_fwd.configs_timings.items():
-            CONFIG_RES[f"graph-h{hidden_size}-b{batch_size}"] += [(str(k), v)]
+    dtype = dtype_str[ifgo.dtype]
+
+    if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernels.one_step_fwd.cache):
+        kernels.one_step_fwd[grid](
+            ifgo_ptr=torch.randn_like(ifgo),  # ifgo gets overwritten
+            cell_ptr=cell,
+            h_ptr=out,
+            W_h_ptr=Wh,
+            offset_ptr=offset,
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            # BLOCK_SIZE_B=BLOCK_SIZE_B,
+            # BLOCK_SIZE_K=BLOCK_SIZE_K,
+            # BLOCK_SIZE_H=BLOCK_SIZE_H,
+            # GROUP_SIZE_B=GROUP_SIZE_B,
+            # num_warps=num_warps,
+            # num_stages=num_stages,
+            dtype=dtype,
+        )
+        if TRACK_AUTOTUNE_RUNTIMES:
+            for k, v in kernels.one_step_fwd.configs_timings.items():
+                CONFIG_RES[f"graph-h{hidden_size}-b{batch_size}"] += [(str(k), v)]
     torch.cuda.nvtx.range_pop()
 
-    if seq_len > 1:
-        torch.cuda.nvtx.range_push("graph capture")
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            offset.add_(1)
-            kernels.one_step_fwd[grid](
-                ifgo_ptr=ifgo,
-                cell_ptr=cell,
-                h_ptr=out,
-                W_h_ptr=Wh,
-                offset_ptr=offset,
-                batch_size=batch_size,
-                hidden_size=hidden_size,
-                # BLOCK_SIZE_B=BLOCK_SIZE_B,
-                # BLOCK_SIZE_K=BLOCK_SIZE_K,
-                # BLOCK_SIZE_H=BLOCK_SIZE_H,
-                # GROUP_SIZE_B=GROUP_SIZE_B,
-                # num_warps=num_warps,
-                # num_stages=num_stages,
-                dtype=dtype_str[ifgo.dtype],
-            )
-        torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_push("replay")
 
-        for _ in range(seq_len - 1):
-            g.replay()
-        torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("graph capture")
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        kernels.one_step_fwd[grid](
+            ifgo_ptr=ifgo,
+            cell_ptr=cell,
+            h_ptr=out,
+            W_h_ptr=Wh,
+            offset_ptr=offset,
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            # BLOCK_SIZE_B=BLOCK_SIZE_B,
+            # BLOCK_SIZE_K=BLOCK_SIZE_K,
+            # BLOCK_SIZE_H=BLOCK_SIZE_H,
+            # GROUP_SIZE_B=GROUP_SIZE_B,
+            # num_warps=num_warps,
+            # num_stages=num_stages,
+            dtype=dtype,
+        )
+        offset.add_(1)
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("replay")
+    for _ in range(seq_len):
+        g.replay()
+    torch.cuda.nvtx.range_pop()
 
     return out, cell, ifgo
 
@@ -1033,7 +1035,7 @@ def lstm_v1_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, mode=2):
 
         if mode == 0:
             kernels.matmul_v2(d_ifgo, Wh, dh_n)
-            kernels.matmul_v2(d_ifgo, Wx, d_x[s])  # s refers to the offset
+            kernels.matmul_v2(d_ifgo, Wx, d_x[offset.item()])
         elif mode == 1:
             kernels.my_matmul_kernel[DgradGrid1](
                 a_ptr=d_ifgo,

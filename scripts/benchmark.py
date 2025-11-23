@@ -139,7 +139,7 @@ if __name__ == "__main__":
     overwrite = True
     dtype = [None, torch.bfloat16, torch.float16][-1]
 
-    flstm.TRACK_AUTOTUNE_RUNTIMES = False
+    flstm.TRACK_AUTOTUNE_RUNTIMES = True
 
     for mode in ["fwd", "full", "bwd"][:1]:
         p = Path(f"{mode}_{fname}.parquet")
@@ -147,7 +147,7 @@ if __name__ == "__main__":
             raise ValueError(f"File {mode}_{fname} exists")
         models = [
             "graph",
-            "lstm"
+            # "lstm"
             # "persistent",
         ]
 
