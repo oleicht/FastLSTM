@@ -4,53 +4,12 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-
-from itertools import product
-
-#######################################################################################
-
-def get_fwd_autotune_configs():
-    return [
-    triton.Config(
-            {
-                "BLOCK_SIZE_H": 8,
-                "BLOCK_SIZE_B": 8,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_B": 8,
-            },
-            num_warps=1,
-            num_stages=s,
-        ) for s in [4, 6, 8] ] + [
-
-        triton.Config(
-            {
-                "BLOCK_SIZE_H": 8,
-                "BLOCK_SIZE_B": 32,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_B": 8,
-            },
-            num_warps=2,
-            num_stages=6,
-        ),
-
-        triton.Config(
-            {
-                "BLOCK_SIZE_H": 32,
-                "BLOCK_SIZE_B": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_B": 8,
-            },
-            num_warps=4,
-            num_stages=6,
-        ),
-    ]
-
-
+from fastlstm import configs
 #######################################################################################
 #################################### fwd kernels ######################################
 #######################################################################################
 @triton.autotune(
-    configs=get_fwd_autotune_configs(),
+    configs=configs.get_graph_fwd_autotune_configs(),
     key=["batch_size", "hidden_size", "dtype"],
 )
 @triton.jit
@@ -176,6 +135,10 @@ def one_step_fwd(
         tl.store(cell_ptrs, c, mask=mask)
         tl.store(h_write_ptrs, h, mask=mask)
 
+@triton.autotune(
+    configs=configs.get_persistent_fwd_autotune_configs(),
+    key=["batch_size", "hidden_size", "dtype"],
+)
 @triton.jit
 def persistent_fwd_kernel(
     ifgo_ptr,
@@ -184,8 +147,8 @@ def persistent_fwd_kernel(
     W_h_ptr,
     seq_len,  # : tl.constexpr,
     global_sync_ptr,
-    b_multi: tl.constexpr,
-    b_offset: tl.constexpr,
+    batch_chunks: tl.constexpr,
+    num_pid_b: tl.constexpr,
     batch_size: tl.constexpr,
     hidden_size: tl.constexpr,
     BLOCK_SIZE_B: tl.constexpr,
@@ -194,7 +157,7 @@ def persistent_fwd_kernel(
     GROUP_SIZE_B: tl.constexpr,
     dtype: tl.constexpr,
 ):
-    num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
+    total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
     num_pid_h = tl.cdiv(hidden_size, BLOCK_SIZE_H)
 
     # old
@@ -228,7 +191,7 @@ def persistent_fwd_kernel(
     elif dtype == "bf16":
         target = tl.bfloat16
 
-    for _ in range(b_multi):
+    for _ in range(batch_chunks):
         global_sync_ptrl = global_sync_ptr + pid_b
 
         offs_ab = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
@@ -332,10 +295,10 @@ def persistent_fwd_kernel(
             # synchronize within block -> h vector is updated
             tl.debug_barrier()
             # update global counter
-            global_sync_ptrl += num_pid_b
+            global_sync_ptrl += total_num_pid_b
             tl.atomic_add(global_sync_ptrl, 1, sem="release")
 
-        pid_b += b_offset
+        pid_b += num_pid_b
 
 
 @triton.jit

@@ -146,9 +146,9 @@ if __name__ == "__main__":
         if not overwrite and p.exists():
             raise ValueError(f"File {mode}_{fname} exists")
         models = [
-            "graph",
+            # "graph",
             # "lstm"
-            # "persistent",
+            "persistent",
         ]
 
         if False:

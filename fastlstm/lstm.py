@@ -1,11 +1,13 @@
 from collections import defaultdict
 from functools import partial
+from importlib import reload
 
 import torch
 import torch.nn as nn
 import triton
 
 import fastlstm.kernels as kernels
+import fastlstm.configs as configs
 from flashrnn import flashrnn
 
 torch.backends.fp32_precision = "tf32"
@@ -57,57 +59,40 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("kernel setup")
-    if triton_config is None:
-        # RTX 2000 Ada
-        BLOCK_SIZE_H = 8
-        BLOCK_SIZE_B = 32
-        BLOCK_SIZE_K = 32
-        GROUP_SIZE_B = 8
-        num_warps = 2
+    # if triton_config is None:
+    #     # RTX 2000 Ada
+    #     BLOCK_SIZE_H = 8
+    #     BLOCK_SIZE_B = 32
+    #     BLOCK_SIZE_K = 32
+    #     GROUP_SIZE_B = 8
+    #     num_warps = 2
 
-        if hidden_size <= 256:
-            num_stages = 6
-        elif hidden_size <= 512:
-            num_stages = 4
-        else:
-            num_stages = 2
+    #     if hidden_size <= 256:
+    #         num_stages = 6
+    #     elif hidden_size <= 512:
+    #         num_stages = 4
+    #     else:
+    #         num_stages = 2
 
-        # H100
-        # BLOCK_SIZE_H = 32
-        # BLOCK_SIZE_B = 32
-        # BLOCK_SIZE_K = 32
-        # GROUP_SIZE_B = 8
-        # num_warps = 2
-        # num_stages = 6
+    #     H100
+    #     BLOCK_SIZE_H = 32
+    #     BLOCK_SIZE_B = 32
+    #     BLOCK_SIZE_K = 32
+    #     GROUP_SIZE_B = 8
+    #     num_warps = 2
+    #     num_stages = 6
 
-    else:
-        BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-        BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-        BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-        GROUP_SIZE_B = triton_config["GROUP_SIZE_B"]
-        num_warps = triton_config["num_warps"]
-        num_stages = triton_config["num_stages"]
+    # else:
+    #     BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
+    #     BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
+    #     BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
+    #     GROUP_SIZE_B = triton_config["GROUP_SIZE_B"]
+    #     num_warps = triton_config["num_warps"]
+    #     num_stages = triton_config["num_stages"]
 
-    # 22 for rtx_2000_ada
-    max_grid_size = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    # modify BLOCK_SIZES to prevent deadlocks. Assumption: one program per SM
-    while triton.cdiv(hidden_size, BLOCK_SIZE_H) > max_grid_size:
-        BLOCK_SIZE_H *= 2
-
-    num_pid_h = triton.cdiv(hidden_size, BLOCK_SIZE_H)
-    num_pid_b = triton.cdiv(batch_size, BLOCK_SIZE_B)
-    b_multi = 1
-    b_offset = 0
-    if num_pid_h * num_pid_b > max_grid_size:
-        num_pid_b = triton.next_power_of_2(num_pid_b) // 2
-        b_multi *= 2
-        while num_pid_h * num_pid_b > max_grid_size:
-            num_pid_b //= 2
-            b_multi *= 2
-        b_offset = num_pid_b
-
-    grid = (num_pid_b * num_pid_h,)
+    grid = configs.compute_persistent_grid_dim 
+    BLOCK_SIZE_B = 32
     global_sync = torch.zeros(
         (
             seq_len,
@@ -119,6 +104,26 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("run kernel")
+
+    dtype = dtype_str[ifgo.dtype]
+    if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernels.persistent_fwd_kernel.cache):
+        configs.BATCH_SIZE = batch_size
+        configs.HIDDEN_SIZE = hidden_size
+        configs.BLOCK_SIZE_B = BLOCK_SIZE_B
+        reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
+            
+        kernels.persistent_fwd_kernel[grid](
+            ifgo_ptr=torch.randn_like(ifgo),  # ifgo gets overwritten
+            cell_ptr=cell,
+            h_ptr=out,
+            W_h_ptr=Wh,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            global_sync_ptr=torch.zeros_like(global_sync),
+            dtype=dtype_str[ifgo.dtype],
+        )
+    
     kernels.persistent_fwd_kernel[grid](
         ifgo_ptr=ifgo,
         cell_ptr=cell,
@@ -128,15 +133,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
         batch_size=batch_size,
         hidden_size=hidden_size,
         global_sync_ptr=global_sync,
-        b_multi=b_multi,
-        b_offset=b_offset,
-        dtype=dtype_str[ifgo.dtype],
-        BLOCK_SIZE_B=BLOCK_SIZE_B,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        BLOCK_SIZE_H=BLOCK_SIZE_H,
-        GROUP_SIZE_B=GROUP_SIZE_B,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        dtype=dtype,
     )
 
     torch.cuda.nvtx.range_pop()
@@ -215,9 +212,9 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     torch.cuda.nvtx.range_push("warmup")
 
     offset = torch.zeros((1,), device=x.device, dtype=torch.int)
-    # warmup / compile
     dtype = dtype_str[ifgo.dtype]
 
+    # if the config hasn't run yet: autotune the kernel
     if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernels.one_step_fwd.cache):
         kernels.one_step_fwd[grid](
             ifgo_ptr=torch.randn_like(ifgo),  # ifgo gets overwritten
@@ -237,7 +234,7 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
         )
         if TRACK_AUTOTUNE_RUNTIMES:
             for k, v in kernels.one_step_fwd.configs_timings.items():
-                CONFIG_RES[f"graph-h{hidden_size}-b{batch_size}"] += [(str(k), v)]
+                CONFIG_RES[f"graph-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
     torch.cuda.nvtx.range_pop()
 
 
