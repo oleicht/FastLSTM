@@ -92,12 +92,8 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
 
 
     grid = configs.compute_persistent_grid_dim 
-    BLOCK_SIZE_B = 32
     global_sync = torch.zeros(
-        (
-            seq_len,
-            triton.cdiv(batch_size, BLOCK_SIZE_B),
-        ),
+            seq_len * triton.cdiv(batch_size, 8),  # BLOCK_SIZE_B>=8 - so this sync tensor is sufficient
         dtype=torch.int,
         device=x.device,
     )
@@ -109,7 +105,6 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernels.persistent_fwd_kernel.cache):
         configs.BATCH_SIZE = batch_size
         configs.HIDDEN_SIZE = hidden_size
-        configs.BLOCK_SIZE_B = BLOCK_SIZE_B
         reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
             
         kernels.persistent_fwd_kernel[grid](
@@ -117,12 +112,15 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
             cell_ptr=cell,
             h_ptr=out,
             W_h_ptr=Wh,
-            seq_len=seq_len,
+            seq_len=min(32, seq_len),
             batch_size=batch_size,
             hidden_size=hidden_size,
             global_sync_ptr=torch.zeros_like(global_sync),
             dtype=dtype_str[ifgo.dtype],
         )
+        if TRACK_AUTOTUNE_RUNTIMES:
+            for k, v in kernels.persistent_fwd_kernel.configs_timings.items():
+                CONFIG_RES[f"persistent-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
     
     kernels.persistent_fwd_kernel[grid](
         ifgo_ptr=ifgo,

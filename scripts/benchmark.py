@@ -3,6 +3,7 @@ import json
 from functools import partial
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -123,19 +124,17 @@ def run_benchmark(config, models, mode, dtype=None):
             warmup *= 1.5
             rep *= 3
 
-        t = do_bench(fn, return_mode="median")  # , warmup=int(warmup), rep=int(rep))
-
-        # try:
-        #     t = do_bench(fn, return_mode="median", warmup=int(warmup), rep=int(rep))
-        # except (torch.OutOfMemoryError, torch.AcceleratorError,
-        #         CompilationError, OutOfResources):
-        #     t = np.nan
+        try:
+            t = do_bench(fn, return_mode="median", warmup=int(warmup), rep=int(rep))
+        except (torch.OutOfMemoryError, torch.AcceleratorError,
+                CompilationError, OutOfResources, ValueError):
+            t = np.nan
         medians += [t]
     return medians
 
 
 if __name__ == "__main__":
-    fname = "graph"
+    fname = "pers"
     overwrite = True
     dtype = [None, torch.bfloat16, torch.float16][-1]
 
@@ -147,7 +146,7 @@ if __name__ == "__main__":
             raise ValueError(f"File {mode}_{fname} exists")
         models = [
             # "graph",
-            # "lstm"
+            # "lstm",
             "persistent",
         ]
 

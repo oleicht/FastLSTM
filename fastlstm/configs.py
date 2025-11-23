@@ -7,43 +7,24 @@ import triton
 # persistent fwd args
 HIDDEN_SIZE=128
 BATCH_SIZE=128
-BLOCK_SIZE_B=32
 
 def get_graph_fwd_autotune_configs():
     return [
     triton.Config(
             {
-                "BLOCK_SIZE_H": 8,
-                "BLOCK_SIZE_B": 8,
-                "BLOCK_SIZE_K": 32,
+                "BLOCK_SIZE_H": h,
+                "BLOCK_SIZE_B": b,
+                "BLOCK_SIZE_K": k,
                 "GROUP_SIZE_B": 8,
             },
-            num_warps=1,
+            num_warps=w,
             num_stages=s,
-        ) for s in [4, 6, 8] ] + [
-
-        triton.Config(
-            {
-                "BLOCK_SIZE_H": 8,
-                "BLOCK_SIZE_B": 32,
-                "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_B": 8,
-            },
-            num_warps=2,
-            num_stages=6,
-        ),
-
-        triton.Config(
-            {
-                "BLOCK_SIZE_H": 32,
-                "BLOCK_SIZE_B": 64,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_B": 8,
-            },
-            num_warps=4,
-            num_stages=6,
-        ),
-    ]
+        ) for s in [4, 6, 8]
+          for w in [1, 2, 4]
+          for k in [32, 64]
+          for h in [8, 16]
+          for b in [8, 16, 32, 64]
+        ]
 
 
 def persistent_layout(hidden_size, BLOCK_SIZE_H, batch_size, BLOCK_SIZE_B):
@@ -79,17 +60,20 @@ def get_persistent_fwd_autotune_configs():
     """
     Be careful here! The setup relies on global state:
     - HIDDEN_SIZE and BATCH_SIZE passed from lstm.py so that no deadlocks occur
-    - BLOCK_SIZE_B can't be automatically tuned at the time
     """
     return [
     triton.Config(
             {
                 "BLOCK_SIZE_K": 32,
                 "GROUP_SIZE_B": 8,
-            } | persistent_layout(BLOCK_SIZE_H=8,
+            } | persistent_layout(BLOCK_SIZE_H=h,
                                   hidden_size=HIDDEN_SIZE,
                                   batch_size=BATCH_SIZE,
-                                  BLOCK_SIZE_B=BLOCK_SIZE_B),
+                                  BLOCK_SIZE_B=b),
             num_warps=2,
             num_stages=s,
-        ) for s in [2, 4, 6] ]
+        )
+        for s in [2, 4, 6]
+        for h in [8, 16, 32]
+        for b in [16, 32, 64]
+        ]
