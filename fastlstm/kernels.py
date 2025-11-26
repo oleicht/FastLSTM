@@ -135,11 +135,188 @@ def one_step_fwd(
         tl.store(cell_ptrs, c, mask=mask)
         tl.store(h_write_ptrs, h, mask=mask)
 
+
 @triton.autotune(
-    configs=configs.get_persistent_fwd_autotune_configs(),
+    configs=configs.get_persistent_fwd_v2_autotune_configs(),
     key=["batch_size", "hidden_size", "dtype"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=['seq_len'])
+def persistent_fwd_kernel_v2(
+    ifgo_ptr,
+    cell_ptr,
+    h_ptr,
+    W_h_ptr,
+    seq_len,  # : tl.constexpr,
+    global_sync_ptr,
+    num_pid_h: tl.constexpr,
+    num_pid_b: tl.constexpr,
+    batch_size: tl.constexpr,
+    hidden_size: tl.constexpr,
+    BLOCK_SIZE_B: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    dtype:  tl.constexpr
+):
+    total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
+    total_num_pid_h = tl.cdiv(hidden_size, BLOCK_SIZE_H)
+
+    # kill configs where sms would be idle
+
+    # old
+    pid = tl.program_id(axis=0)
+    pid_b = pid // num_pid_h
+    pid_h = pid % num_pid_h
+
+    batch_hidden_4 = batch_size * 4 * hidden_size
+    hidden_4 = 4 * hidden_size
+
+    for pb in range(pid_b, total_num_pid_b, num_pid_b):
+        global_sync_ptrl = global_sync_ptr + pb
+
+        for sid in range(seq_len):
+            if sid > 0:
+                while tl.atomic_add(global_sync_ptrl, 0, sem="acquire") < num_pid_h:
+                    pass
+
+            # loop over hidden patches
+            for ph in range(pid_h, total_num_pid_h, num_pid_h):
+                i_ptrs = tl.make_block_ptr(ifgo_ptr + sid * batch_hidden_4,
+                                           (batch_size, 4, hidden_size),
+                                           (hidden_4, hidden_size, 1),
+                                           (pb*BLOCK_SIZE_B, 0, ph*BLOCK_SIZE_H),
+                                           (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                                           (0, 1, 2))
+                i = tl.load(i_ptrs, boundary_check=(0, 2)).reshape(BLOCK_SIZE_B, BLOCK_SIZE_H)
+
+                f_ptrs = tl.make_block_ptr(ifgo_ptr + sid * batch_hidden_4,
+                                           (batch_size, 4, hidden_size),
+                                           (hidden_4, hidden_size, 1),
+                                           (pb*BLOCK_SIZE_B, 1, ph*BLOCK_SIZE_H),
+                                           (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                                           (0, 1, 2))
+                f = tl.load(f_ptrs, boundary_check=(0, 2)).reshape(BLOCK_SIZE_B, BLOCK_SIZE_H)
+
+                g_ptrs = tl.make_block_ptr(ifgo_ptr + sid * batch_hidden_4,
+                                           (batch_size, 4, hidden_size),
+                                           (hidden_4, hidden_size, 1),
+                                           (pb*BLOCK_SIZE_B, 2, ph*BLOCK_SIZE_H),
+                                           (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                                           (0, 1, 2))
+
+                g = tl.load(g_ptrs, boundary_check=(0, 2)).reshape(BLOCK_SIZE_B, BLOCK_SIZE_H)
+
+                o_ptrs = tl.make_block_ptr(ifgo_ptr + sid * batch_hidden_4,
+                                           (batch_size, 4, hidden_size),
+                                           (hidden_4, hidden_size, 1),
+                                           (pb*BLOCK_SIZE_B, 3, ph*BLOCK_SIZE_H),
+                                           (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                                           (0, 1, 2))
+
+                o = tl.load(o_ptrs, boundary_check=(0, 2)).reshape(BLOCK_SIZE_B, BLOCK_SIZE_H)
+                # note! it's W_h.T not W_h!!
+                # (batch_size, hidden_size) x (hidden_size, 4 x hidden_size)
+
+                for k in range(tl.cdiv(hidden_size, BLOCK_SIZE_K)):
+                    h_mm_ptrs = tl.make_block_ptr(h_ptr+sid * batch_size * hidden_size,
+                                                  (batch_size, hidden_size),
+                                                  (hidden_size, 1),
+                                                  (pb*BLOCK_SIZE_B, k * BLOCK_SIZE_K),
+                                                  (BLOCK_SIZE_B, BLOCK_SIZE_K),
+                                                  (0, 1))
+
+                    h_0 = tl.load(
+                        h_mm_ptrs, boundary_check=(0, 1))
+
+                    W_i_ptr = tl.make_block_ptr(W_h_ptr,
+                                                (hidden_size, hidden_size, 4),
+                                                (1, hidden_size, hidden_size * hidden_size),
+                                                (k * BLOCK_SIZE_K, ph*BLOCK_SIZE_H, 0),
+                                                (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
+                                                (2, 1, 0))
+
+                    W_i = tl.load(W_i_ptr, boundary_check=(1, 2)).reshape(BLOCK_SIZE_K, BLOCK_SIZE_H)
+
+                    W_f_ptr = tl.make_block_ptr(W_h_ptr,
+                                                (hidden_size, hidden_size, 4),
+                                                (1, hidden_size, hidden_size * hidden_size),
+                                                (k * BLOCK_SIZE_K, ph*BLOCK_SIZE_H, 1),
+                                                (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
+                                                (2, 1, 0))
+                    W_f = tl.load(W_f_ptr, boundary_check=(1, 2)).reshape(BLOCK_SIZE_K, BLOCK_SIZE_H)
+
+                    W_g_ptr = tl.make_block_ptr(W_h_ptr,
+                                                (hidden_size, hidden_size, 4),
+                                                (1, hidden_size, hidden_size * hidden_size),
+                                                (k * BLOCK_SIZE_K, ph*BLOCK_SIZE_H, 2),
+                                                (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
+                                                (2, 1, 0))
+                    W_g = tl.load(W_g_ptr, boundary_check=(1, 2)).reshape(BLOCK_SIZE_K, BLOCK_SIZE_H)
+
+                    W_o_ptr = tl.make_block_ptr(W_h_ptr,
+                                                (hidden_size, hidden_size, 4),
+                                                (1, hidden_size, hidden_size * hidden_size),
+                                                (k * BLOCK_SIZE_K, ph*BLOCK_SIZE_H, 3),
+                                                (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
+                                                (2, 1, 0))
+                    W_o = tl.load(W_o_ptr, boundary_check=(1, 2)).reshape(BLOCK_SIZE_K, BLOCK_SIZE_H)
+
+                    i = tl.dot(h_0, W_i, i)
+                    f = tl.dot(h_0, W_f, f)
+                    g = tl.dot(h_0, W_g, g)
+                    o = tl.dot(h_0, W_o, o)
+
+                # reset accumulator pointers for next iteration
+
+                tl.store(i_ptrs, i.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
+                tl.store(f_ptrs, f.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
+                tl.store(g_ptrs, g.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
+                tl.store(o_ptrs, o.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
+
+                # step 2: compute c and h
+                # update the pointers first, so the write goes to i+1 element
+                cell_ptrs = tl.make_block_ptr(cell_ptr+sid * batch_size * hidden_size,
+                                              (batch_size, hidden_size),
+                                              (hidden_size, 1),
+                                              (pb*BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
+                                              (BLOCK_SIZE_B, BLOCK_SIZE_H),
+                                              (0, 1))
+
+                c = tl.load(cell_ptrs, boundary_check=(0, 1))
+
+
+                h_write_ptrs = tl.make_block_ptr(h_ptr+(sid+1) * batch_size * hidden_size,
+                                                 (batch_size, hidden_size),
+                                                 (hidden_size, 1),
+                                                 (pb*BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
+                                                 (BLOCK_SIZE_B, BLOCK_SIZE_H),
+                                                 (0, 1))
+
+                cell_ptrs = tl.make_block_ptr(cell_ptr+(sid+1) * batch_size * hidden_size,
+                                              (batch_size, hidden_size),
+                                              (hidden_size, 1),
+                                              (pb*BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
+                                              (BLOCK_SIZE_B, BLOCK_SIZE_H),
+                                              (0, 1))
+
+                c = tl.sigmoid(f) * c + tl.sigmoid(i) * libdevice.tanh(g)
+                h = tl.sigmoid(o) * libdevice.tanh(c)
+
+                tl.store(cell_ptrs, c, boundary_check=(0, 1))
+                tl.store(h_write_ptrs, h, boundary_check=(0, 1))
+
+            # synchronize within block -> h vector is updated
+            tl.debug_barrier()
+            # update global counter
+            global_sync_ptrl += total_num_pid_b
+            tl.atomic_add(global_sync_ptrl, 1, sem="release")
+
+
+
+@triton.autotune(
+    configs=configs.get_persistent_fwd_autotune_configs(configs.ProblemShape),
+    key=["batch_size", "hidden_size", "dtype"],
+)
+@triton.jit(do_not_specialize=['seq_len'])
 def persistent_fwd_kernel(
     ifgo_ptr,
     cell_ptr,

@@ -1,10 +1,17 @@
+from dataclasses import dataclass
+
 import torch
 import triton
 
 
-# persistent fwd args
-HIDDEN_SIZE=128
-BATCH_SIZE=128
+@dataclass
+class PersistentFwdData:
+    BATCH_SIZE: int = 128
+    HIDDEN_SIZE: int = 128
+
+ProblemShape = PersistentFwdData()
+
+SM_count =  torch.cuda.get_device_properties("cuda").multi_processor_count
 
 def get_graph_fwd_autotune_configs():
     return [
@@ -25,14 +32,9 @@ def get_graph_fwd_autotune_configs():
         ]
 
 
-def persistent_layout(hidden_size, BLOCK_SIZE_H, batch_size, BLOCK_SIZE_B):
-    max_grid_size = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-    # modify BLOCK_SIZES to prevent deadlocks. Assumption: one program per SM
-    while triton.cdiv(hidden_size, BLOCK_SIZE_H) > max_grid_size:
-        BLOCK_SIZE_H *= 2
-
-    num_pid_h = triton.cdiv(hidden_size, BLOCK_SIZE_H)
+def compute_batch_layout(hidden_size, BLOCK_SIZE_H, batch_size, BLOCK_SIZE_B):
+    max_grid_size = SM_count
+    num_pid_h=triton.cdiv(hidden_size, BLOCK_SIZE_H)
     num_pid_b = triton.cdiv(batch_size, BLOCK_SIZE_B)
     batch_chunks = 1
     if num_pid_h * num_pid_b > max_grid_size:
@@ -42,39 +44,90 @@ def persistent_layout(hidden_size, BLOCK_SIZE_H, batch_size, BLOCK_SIZE_B):
             num_pid_b //= 2
             batch_chunks *= 2
 
-    return {"BLOCK_SIZE_H": BLOCK_SIZE_H,
+    return {"batch_chunks": batch_chunks,
+            "num_pid_b": num_pid_b,
             "BLOCK_SIZE_B": BLOCK_SIZE_B,
-            "batch_chunks": batch_chunks,
-            "num_pid_b": num_pid_b
+            "BLOCK_SIZE_H": BLOCK_SIZE_H,
             }
 
 
 def compute_persistent_grid_dim(kwargs):
     num_pid_b = kwargs["num_pid_b"]
-    num_pid_h = triton.cdiv(kwargs["hidden_size"], kwargs["BLOCK_SIZE_H"])
-    assert num_pid_b * num_pid_h  < torch.cuda.get_device_properties("cuda").multi_processor_count
+    if "num_pid_h" in kwargs:
+        num_pid_h = kwargs["num_pid_h"]
+    else:
+        num_pid_h = triton.cdiv(kwargs["hidden_size"], kwargs["BLOCK_SIZE_H"])
+
+    assert num_pid_b * num_pid_h  <= SM_count
+        
     return (num_pid_b * num_pid_h, )
 
 
-def get_persistent_fwd_autotune_configs():
+def get_persistent_fwd_autotune_configs(pfd: PersistentFwdData):
     """
     Be careful here! The setup relies on global state:
     - HIDDEN_SIZE and BATCH_SIZE passed from lstm.py so that no deadlocks occur
     """
-    return [
+    # step 1:
+    # restrict to block_sizes_h that lead to non-deadlocked configs
+    print(pfd)
+    hidden_block_sizes = []
+    for block_size in [8, 16, 32, 64, 128, 256]:
+        if triton.cdiv(pfd.HIDDEN_SIZE, block_size) > SM_count:
+            continue
+        elif block_size >= 2 * pfd.HIDDEN_SIZE: 
+            continue
+
+        hidden_block_sizes += [block_size]
+    assert len(hidden_block_sizes) > 0, f"BLOCK_SIZE_H not large enough to support hidden_size {pfd.HIDDEN_SIZE} on {SM_count} many SMs."
+
+    configs =  [
     triton.Config(
             {
                 "BLOCK_SIZE_K": 32,
                 "GROUP_SIZE_B": 8,
-            } | persistent_layout(BLOCK_SIZE_H=h,
-                                  hidden_size=HIDDEN_SIZE,
-                                  batch_size=BATCH_SIZE,
-                                  BLOCK_SIZE_B=b),
+            } | compute_batch_layout(hidden_size=pfd.HIDDEN_SIZE,
+                                     BLOCK_SIZE_H=h,
+                                     batch_size=pfd.BATCH_SIZE,
+                                     BLOCK_SIZE_B=b),
             num_warps=w,
             num_stages=s,
         )
-        for w in [1, 2, 4]
+        for w in [2, 4]
         for s in [2, 4, 6, 8]
-        for h in [8, 16, 32]
-        for b in [16, 32, 64]
-        ]
+        for h in hidden_block_sizes
+        for b in [16, 32, 64, 128]
+        if ((b < 2 * pfd.BATCH_SIZE) or (pfd.BATCH_SIZE < 16 and b == 16))]
+    
+    best_sm_ratio = max([c.kwargs["num_pid_b"] * (triton.cdiv(pfd.HIDDEN_SIZE, c.kwargs["BLOCK_SIZE_H"]) ) / SM_count for c in configs])
+    # remove configs that utilize too few SMs
+    configs = [c for c in configs if c.kwargs["num_pid_b"] * (triton.cdiv(pfd.HIDDEN_SIZE, c.kwargs["BLOCK_SIZE_H"])) / SM_count > 0.75 * best_sm_ratio]
+
+    assert len(configs)>0
+    print(f"num_configs: {len(configs)}")
+    return configs
+
+
+def get_persistent_fwd_v2_autotune_configs():
+    configs = [
+        triton.Config(
+            {
+                "BLOCK_SIZE_K": 32,
+                "BLOCK_SIZE_H": h,
+                "BLOCK_SIZE_B": b,
+                "num_pid_h": nh,
+                "num_pid_b": nb,
+            },
+            num_warps=w,
+            num_stages=s,
+        )
+        for w in [2, 4]
+        for s in [2, 4, 6]
+        for h in [8, 16, 32, 64, 128]
+        for b in [8, 16, 32, 64, 128]
+        for nh, nb in [(11, 2),
+                       # (8, 2)
+                       ]
+    ]
+    print(f"persistent v2: {len(configs)}")
+    return configs

@@ -22,7 +22,7 @@ def generate_configs():
     - hidden_size = [64 ... 2048]
     """
     configs = {}
-    for seq_len, bs, hs, layer in product(range(3, 4), range(5,-1,-1), range(5,-1,-1), range(1)):
+    for seq_len, bs, hs, layer in product(range(3, 4), range(5, -1, -1), range(5, -1,-1), range(1)):
         name = f"s{seq_len}_b{bs}_h{hs}_l{layer}"
         configs[name] = (64 << seq_len, 4 << bs, 64 << hs, 1 + layer)
 
@@ -134,9 +134,9 @@ def run_benchmark(config, models, mode, dtype=None):
 
 
 if __name__ == "__main__":
-    fname = "pers"
+    fname = "persistentBasic3"
     overwrite = True
-    dtype = [None, torch.bfloat16, torch.float16][-1]
+    dtype = [None, torch.bfloat16, torch.float16][0]
 
     flstm.TRACK_AUTOTUNE_RUNTIMES = True
 
@@ -146,7 +146,7 @@ if __name__ == "__main__":
             raise ValueError(f"File {mode}_{fname} exists")
         models = [
             # "graph",
-            # "lstm",
+            "lstm",
             "persistent",
         ]
 

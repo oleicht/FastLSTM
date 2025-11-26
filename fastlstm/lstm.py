@@ -25,8 +25,7 @@ dtype_str = {
     torch.bfloat16: "bf16",
 }
 
-
-def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
+def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1):
     torch.cuda.nvtx.range_push("fwd setup")
     if x.dim() == 2:
         x = x[None]
@@ -102,27 +101,34 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     torch.cuda.nvtx.range_push("run kernel")
 
     dtype = dtype_str[ifgo.dtype]
-    if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernels.persistent_fwd_kernel.cache):
-        configs.BATCH_SIZE = batch_size
-        configs.HIDDEN_SIZE = hidden_size
-        reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
-            
-        kernels.persistent_fwd_kernel[grid](
+
+    kernel = kernels.persistent_fwd_kernel_v2 if version==2 else kernels.persistent_fwd_kernel
+ 
+    if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernel.cache):
+        # triton.heuristics can't be used here
+        # we need to modify the triton.Configs as a function of the inputs which isn't supported
+
+        if version==1:
+            configs.ProblemShape = configs.PersistentFwdData(BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size)
+            reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
+            kernel = kernels.persistent_fwd_kernel
+
+        kernel[grid](
             ifgo_ptr=torch.randn_like(ifgo),  # ifgo gets overwritten
             cell_ptr=cell,
             h_ptr=out,
             W_h_ptr=Wh,
-            seq_len=min(32, seq_len),
+            seq_len=6,
             batch_size=batch_size,
             hidden_size=hidden_size,
             global_sync_ptr=torch.zeros_like(global_sync),
             dtype=dtype_str[ifgo.dtype],
         )
         if TRACK_AUTOTUNE_RUNTIMES:
-            for k, v in kernels.persistent_fwd_kernel.configs_timings.items():
+            for k, v in kernel.configs_timings.items():
                 CONFIG_RES[f"persistent-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
     
-    kernels.persistent_fwd_kernel[grid](
+    kernel[grid](
         ifgo_ptr=ifgo,
         cell_ptr=cell,
         h_ptr=out,
