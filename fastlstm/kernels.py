@@ -9,7 +9,7 @@ from fastlstm import configs
 #################################### fwd kernels ######################################
 #######################################################################################
 @triton.autotune(
-    configs=configs.get_graph_fwd_autotune_configs(),
+    configs=configs.get_graph_autotune_configs(),
     key=["batch_size", "hidden_size", "dtype"],
 )
 @triton.jit
@@ -1112,7 +1112,8 @@ def lstm_full_Wgrad(
     if pid_n == 0:
         tl.store(db_ptr + offs_cm, db, mask=offs_cm < M)
 
-
+@triton.autotune(configs=configs.get_graph_autotune_configs(),
+                 key=["batch_size", "hidden_size", "dtype"],)
 @triton.jit
 def lstm_overlap_bwd(
     ifgo_ptr,
@@ -1130,7 +1131,7 @@ def lstm_overlap_bwd(
     BLOCK_SIZE_B: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  #
-    GROUP_SIZE_M: tl.constexpr,  #
+    GROUP_SIZE_B: tl.constexpr,  #
     dtype: tl.constexpr,
 ):
     """Compute:
@@ -1154,10 +1155,10 @@ def lstm_overlap_bwd(
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(batch_size, BLOCK_SIZE_B)
     num_pid_n = tl.cdiv(hidden_size, BLOCK_SIZE_H)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    num_pid_in_group = GROUP_SIZE_B * num_pid_n
     group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    first_pid_m = group_id * GROUP_SIZE_B
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_B)
     pid_b = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_h = (pid % num_pid_in_group) // group_size_m
 
@@ -1176,7 +1177,7 @@ def lstm_overlap_bwd(
     tl.assume(BLOCK_SIZE_B > 0)
     tl.assume(BLOCK_SIZE_K > 0)
     tl.assume(BLOCK_SIZE_H > 0)
-    tl.assume(GROUP_SIZE_M > 0)
+    tl.assume(GROUP_SIZE_B > 0)
     tl.assume(seq_offset >= 0)
 
     offs_am = (pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)) % batch_size

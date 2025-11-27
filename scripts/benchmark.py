@@ -22,7 +22,7 @@ def generate_configs():
     - hidden_size = [64 ... 2048]
     """
     configs = {}
-    for bs, hs, layer, seq_len in product(range(5, -1, -1), range(5, -1,-1), range(1), range(4)):
+    for bs, hs, layer, seq_len in product(range(5, -1, -1), range(5, -1,-1), range(1), range(3, 4)):
         name = f"s{64 << seq_len}_b{4 << bs}_h{64 << hs}_l{1 + layer}"
         configs[name] = (64 << seq_len, 4 << bs, 64 << hs, 1 + layer)
 
@@ -129,13 +129,14 @@ def run_benchmark(config, models, mode, dtype=None):
         except (torch.OutOfMemoryError, torch.AcceleratorError,
                 CompilationError, OutOfResources, ValueError):
             t = np.nan
+        torch.cuda.synchronize()
         medians += [t]
     return medians
 
 
 if __name__ == "__main__":
-    fname = "bench"
-    overwrite = True
+    fname = "fp16"
+    overwrite = False
     dtype = [None, torch.bfloat16, torch.float16][2]
 
     flstm.TRACK_AUTOTUNE_RUNTIMES = True
@@ -145,8 +146,7 @@ if __name__ == "__main__":
         if not overwrite and p.exists():
             raise ValueError(f"File {mode}_{fname} exists")
         models = [
-            # "graph",
-            "lstm",
+            "graph",
             "persistent",
         ]
 
@@ -157,7 +157,7 @@ if __name__ == "__main__":
                 "triton_fused",
             ]
 
-        if False and mode != "bwd":
+        if mode != "bwd":
             models += [
                 "lstm",
                 "fast",
@@ -174,4 +174,4 @@ if __name__ == "__main__":
 
             if flstm.TRACK_AUTOTUNE_RUNTIMES:
                 with open(f"tuning_{mode}_{fname}.json", "w") as fh:
-                    json.dump(flstm.CONFIG_RES, fh, default=str)
+                    json.dump(flstm.CONFIG_RES, fh, default=str, indent=2)

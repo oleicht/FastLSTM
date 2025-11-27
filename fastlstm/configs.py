@@ -13,7 +13,7 @@ ProblemShape = PersistentData()
 
 SM_count =  torch.cuda.get_device_properties("cuda").multi_processor_count
 
-def get_graph_fwd_autotune_configs():
+def get_graph_autotune_configs():
     return [
     triton.Config(
             {
@@ -29,7 +29,7 @@ def get_graph_fwd_autotune_configs():
           for k in [32, 64]
           for h in [8, 16]
           for b in [8, 16, 32, 64]
-        ][:2]
+        ]
 
 
 def compute_batch_layout(hidden_size, BLOCK_SIZE_H, batch_size, BLOCK_SIZE_B):

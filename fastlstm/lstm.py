@@ -1,6 +1,7 @@
 from collections import defaultdict
 from functools import partial
 from importlib import reload
+import math
 
 import torch
 import torch.nn as nn
@@ -481,36 +482,41 @@ def lstm_graph_bwd(
     grid = (
         triton.cdiv(hidden_size, BLOCK_SIZE_H) * triton.cdiv(batch_size, BLOCK_SIZE_B),
     )
+    grid = lambda META: (triton.cdiv(hidden_size, META["BLOCK_SIZE_H"]) * triton.cdiv(batch_size, META["BLOCK_SIZE_B"]), )
 
     point_grid = (
         triton.cdiv(hidden_size, 32),
         triton.cdiv(batch_size, 32),
     )
+    dtype = dtype_str[ifgo.dtype]
 
-    def run():
+    def run(warmup=True):
         if overlap_version:
             kernels.lstm_overlap_bwd[grid](
                 ifgo_ptr=ifgo,
                 cell_ptr=cell,
-                d_c_ptr=dc_n,
+                d_c_ptr=dc_n if not warmup else torch.randn_like(dc_n),
                 d_ifgo_ptr=d_ifgo,
                 d_out_ptr=dh,
                 Wh_ptr=Wh,
-                dh_n_ptr=dh_n,
+                dh_n_ptr=dh_n if not warmup else torch.randn_like(dh_n),
                 hidden_size=hidden_size,
                 batch_size=batch_size,
                 seq_len=seq_len,
-                offset_ptr=offset,
-                BLOCK_SIZE_B=BLOCK_SIZE_B,
-                BLOCK_SIZE_H=BLOCK_SIZE_H,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                GROUP_SIZE_M=8,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                dtype=dtype_str[ifgo.dtype],
+                offset_ptr=offset if not warmup else torch.ones_like(offset),  # don't take first or last for tuning!
+                # BLOCK_SIZE_B=BLOCK_SIZE_B,
+                # BLOCK_SIZE_H=BLOCK_SIZE_H,
+                # BLOCK_SIZE_K=BLOCK_SIZE_K,
+                # GROUP_SIZE_M=8,
+                # num_warps=num_warps,
+                # num_stages=num_stages,
+                dtype=dtype,
             )
-        offset.add_(-1)
+        if not warmup:
+            offset.add_(-1)
+
         if not overlap_version:
+            assert not warmup, f"Tuning is not implemented"
             kernels.lstm_ifgo_bwd[point_grid](
                 d_out_ptr=dh,
                 d_h_ptr=dh_n,
@@ -524,7 +530,7 @@ def lstm_graph_bwd(
                 hidden_size=hidden_size,
                 BLOCK_SIZE_H=32,
                 BLOCK_SIZE_B=32,
-                dtype=dtype_str[ifgo.dtype],
+                dtype=dtype,
             )
             kernels.lstm_h_grad[grid](
                 d_ifgo_ptr=d_ifgo,
@@ -539,18 +545,22 @@ def lstm_graph_bwd(
                 GROUP_SIZE_M=8,
                 num_warps=num_warps,
                 num_stages=num_stages,
-                dtype=dtype_str[ifgo.dtype],
+                dtype=dtype,
             )
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("graph bwd warmup")
-    run()
+    run(warmup=True)
+    if TRACK_AUTOTUNE_RUNTIMES:
+        for k, v in kernels.lstm_overlap_bwd.configs_timings.items():
+            CONFIG_RES[f"graphBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
+
     torch.cuda.nvtx.range_pop()
     if seq_len > 1:
         torch.cuda.nvtx.range_push("graph bwd capture kernel")
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            run()
+            run(warmup=False)
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("replay kernel")
@@ -709,11 +719,20 @@ class LSTMfn(torch.autograd.Function):
         # select kernel
         _, batch_size, hidden_size = x.shape
         fn = lstm_graph_fwd
-        if hidden_size >= 1024:
-            fn = lstm_graph_fwd
-        elif (batch_size < 64) or (hidden_size <= 64):
+        # was for fp32
+        # if hidden_size >= 1024:
+        #     fn = lstm_graph_fwd
+        # elif (batch_size < 64) or (hidden_size <= 64):
+        #     fn = lstm_persistent_fwd
+        # elif (hidden_size / 64) + (batch_size / 64) < 3.5:
+        #     fn = lstm_persistent_fwd
+        if hidden_size < 512:
             fn = lstm_persistent_fwd
-        elif (hidden_size / 64) + (batch_size / 64) < 3.5:
+        elif batch_size < 8 or hidden_size > 1500:
+            fn = lstm_graph_fwd
+        elif math.log2(batch_size)/6 + math.log2(hidden_size)/10 > 1.99:
+            fn = lstm_graph_fwd
+        else:
             fn = lstm_persistent_fwd
 
         torch.cuda.nvtx.range_push("graph_fwd")
@@ -729,10 +748,14 @@ class LSTMfn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dh, d_out_cell):
         # select kernel
-        if dh.shape[-1] < 1500:
-            fn = lstm_persistent_bwd
-        else:
+        # if dh.shape[-1] < 1500:
+        #     fn = lstm_persistent_bwd
+        # else:
+        #     fn = lstm_graph_bwd
+        if dh.shape[-1] > 368 and  dh.shape[1] < 8:
             fn = lstm_graph_bwd
+        else:
+            fn = lstm_persistent_bwd        
 
         torch.cuda.nvtx.range_push("graph_bwd")
         x, out, cell, ifgo, Wx, Wh = ctx.saved_tensors
