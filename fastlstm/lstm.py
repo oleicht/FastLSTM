@@ -92,7 +92,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1
 
     grid = configs.compute_persistent_grid_dim 
     global_sync = torch.zeros(
-            seq_len * triton.cdiv(batch_size, 8),  # BLOCK_SIZE_B>=8 - so this sync tensor is sufficient
+            seq_len * batch_size,
         dtype=torch.int,
         device=x.device,
     )
@@ -107,9 +107,9 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1
     if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernel.cache):
         # triton.heuristics can't be used here
         # we need to modify the triton.Configs as a function of the inputs which isn't supported
-
-        if version==1:
-            configs.ProblemShape = configs.PersistentFwdData(BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size)
+        CurrentShape = configs.PersistentData(BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size)
+        if version==1 and (configs.ProblemShape != CurrentShape):
+            configs.ProblemShape = CurrentShape
             reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
             kernel = kernels.persistent_fwd_kernel
 
@@ -312,27 +312,60 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("persistent bwd grid setup")
-    num_b_splits = triton.cdiv(batch_size, BLOCK_SIZE_B)
-    max_grid_size = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    while triton.cdiv(hidden_size, BLOCK_SIZE_H) > max_grid_size:
-        BLOCK_SIZE_H *= 2
-    num_h_splits = triton.cdiv(hidden_size, BLOCK_SIZE_H)
+    # num_b_splits = triton.cdiv(batch_size, BLOCK_SIZE_B)
+    # max_grid_size = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    num_batch_iter = 1
-    while (
-        num_h_splits * triton.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B)
-        > max_grid_size
-    ):
-        num_batch_iter += 1
+    # while triton.cdiv(hidden_size, BLOCK_SIZE_H) > max_grid_size:
+    #     BLOCK_SIZE_H *= 2
+    # num_h_splits = triton.cdiv(hidden_size, BLOCK_SIZE_H)
 
-    Pgrid = (num_h_splits * triton.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B),)
+    # num_batch_iter = 1
+    # while (
+    #     num_h_splits * triton.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B)
+    #     > max_grid_size
+    # ):
+    #     num_batch_iter += 1
 
-    sync = torch.zeros((seq_len, num_b_splits), dtype=torch.int, device=x.device)
+    # Pgrid = (num_h_splits * triton.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B),)
+    Pgrid = configs.compute_persistent_grid_dim
+
+    sync = torch.zeros((seq_len * batch_size), dtype=torch.int, device=x.device)
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("persistent bwd kernel")
-    kernels.lstm_persistent_seq_bwd[Pgrid](
+    dtype = dtype_str[ifgo.dtype]
+    kernel = kernels.lstm_persistent_seq_bwd
+
+    if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernel.cache):
+        # triton.heuristics can't be used here
+        # we need to modify the triton.Configs as a function of the inputs which isn't supported
+        CurrentShape = configs.PersistentData(BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size)
+        if (configs.ProblemShape != CurrentShape):
+            configs.ProblemShape = CurrentShape
+            reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
+            kernel = kernels.lstm_persistent_seq_bwd
+
+        kernel[Pgrid](
+            d_out_ptr=dh,
+            d_h_ptr=torch.randn_like(dh_n),
+            d_c_ptr=torch.randn_like(dc_n),
+            d_ifgo_ptr=d_ifgo,
+            ifgo_ptr=ifgo,
+            cell_ptr=cell,
+            Wh_ptr=Wh,
+            sync_ptr=torch.zeros_like(sync),
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            seq_len=6,
+            dtype=dtype
+            )
+        if TRACK_AUTOTUNE_RUNTIMES:
+            for k, v in kernel.configs_timings.items():
+                CONFIG_RES[f"persistentBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
+
+
+    kernel[Pgrid](
         d_out_ptr=dh,
         d_h_ptr=dh_n,
         d_c_ptr=dc_n,
@@ -341,16 +374,16 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
         cell_ptr=cell,
         Wh_ptr=Wh,
         sync_ptr=sync,
-        num_batch_iter=num_batch_iter,
         batch_size=batch_size,
         hidden_size=hidden_size,
         seq_len=seq_len,
-        BLOCK_SIZE_H=BLOCK_SIZE_H,
-        BLOCK_SIZE_B=BLOCK_SIZE_B,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        dtype=dtype_str[ifgo.dtype],
+        # num_batch_iter=num_batch_iter,
+        # BLOCK_SIZE_H=BLOCK_SIZE_H,
+        # BLOCK_SIZE_B=BLOCK_SIZE_B,
+        # BLOCK_SIZE_K=BLOCK_SIZE_K,
+        # num_warps=num_warps,
+        # num_stages=num_stages,
+        dtype=dtype,
     )
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("matmuls for gradients")

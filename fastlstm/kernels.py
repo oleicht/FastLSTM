@@ -313,7 +313,7 @@ def persistent_fwd_kernel_v2(
 
 
 @triton.autotune(
-    configs=configs.get_persistent_fwd_autotune_configs(configs.ProblemShape),
+    configs=configs.get_persistent_autotune_configs(configs.ProblemShape),
     key=["batch_size", "hidden_size", "dtype"],
 )
 @triton.jit(do_not_specialize=['seq_len'])
@@ -331,7 +331,6 @@ def persistent_fwd_kernel(
     BLOCK_SIZE_B: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
-    GROUP_SIZE_B: tl.constexpr,
     dtype: tl.constexpr,
 ):
     total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
@@ -359,7 +358,6 @@ def persistent_fwd_kernel(
     tl.assume(BLOCK_SIZE_B > 0)
     tl.assume(BLOCK_SIZE_K > 0)
     tl.assume(BLOCK_SIZE_H > 0)
-    tl.assume(GROUP_SIZE_B > 0)
 
     if dtype == "fp32":
         target = tl.float32
@@ -851,7 +849,11 @@ def lstm_h_grad(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton.autotune(
+    configs=configs.get_persistent_autotune_configs(configs.ProblemShape),
+    key=["batch_size", "hidden_size", "dtype"],
+)
+@triton.jit(do_not_specialize=["seq_len"])
 def lstm_persistent_seq_bwd(
     d_out_ptr,
     d_h_ptr,
@@ -862,17 +864,19 @@ def lstm_persistent_seq_bwd(
     Wh_ptr,
     sync_ptr,
     seq_len,
-    num_batch_iter,
-    batch_size,
-    hidden_size,
+    # num_batch_iter,
+    batch_chunks: tl.constexpr,
+    num_pid_b: tl.constexpr,
+    batch_size: tl.constexpr,
+    hidden_size: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_B: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     dtype: tl.constexpr,
-):
+    ):
     pid = tl.program_id(axis=0)
     num_pid_h = tl.cdiv(hidden_size, BLOCK_SIZE_H)
-    num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
+    total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
 
     if dtype == "fp16":
         target = tl.float16
@@ -880,10 +884,11 @@ def lstm_persistent_seq_bwd(
         target = tl.bfloat16
 
     pid_h = pid % num_pid_h
+    pid_b = pid // num_pid_h
 
     tl.assume(pid >= 0)
     tl.assume(num_pid_h > 0)
-    tl.assume(num_pid_b > 0)
+    tl.assume(total_num_pid_b > 0)
     tl.assume(hidden_size > 0)
     tl.assume(batch_size > 0)
     tl.assume(seq_len > 0)
@@ -897,16 +902,10 @@ def lstm_persistent_seq_bwd(
     d_out_ptr += (seq_len - 1) * hidden_size * batch_size
 
     offsets_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)[None]
-
-    # how many pids for b do we actually get?
-    b_pids = tl.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B)
     # but we need num_pid_b many
     #
-
-    for nbi in range(num_batch_iter):
-        pid_b = (pid // num_pid_h) + nbi * b_pids
-
-        if pid_b < num_pid_b:
+    for _ in range(batch_chunks):
+        if pid_b < total_num_pid_b:
             s = sync_ptr + pid_b
             offsets_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)[:, None]
 
@@ -991,7 +990,7 @@ def lstm_persistent_seq_bwd(
                 while tl.atomic_add(s, 0, sem="acquire") < num_pid_h:
                     pass
 
-                s += num_pid_b
+                s += total_num_pid_b
 
                 offs_am = offsets_b % batch_size
                 offs_bn = offsets_h % N
@@ -1030,6 +1029,8 @@ def lstm_persistent_seq_bwd(
         d_ifgo_ptr += seq_len * batch_size * 4 * hidden_size
         cell_ptr += seq_len * batch_size * hidden_size
         d_out_ptr += seq_len * batch_size * hidden_size
+
+        pid_b += num_pid_b
 
 
 @triton.jit

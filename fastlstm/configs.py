@@ -5,11 +5,11 @@ import triton
 
 
 @dataclass
-class PersistentFwdData:
+class PersistentData:
     BATCH_SIZE: int = 128
     HIDDEN_SIZE: int = 128
 
-ProblemShape = PersistentFwdData()
+ProblemShape = PersistentData()
 
 SM_count =  torch.cuda.get_device_properties("cuda").multi_processor_count
 
@@ -29,7 +29,7 @@ def get_graph_fwd_autotune_configs():
           for k in [32, 64]
           for h in [8, 16]
           for b in [8, 16, 32, 64]
-        ]
+        ][:2]
 
 
 def compute_batch_layout(hidden_size, BLOCK_SIZE_H, batch_size, BLOCK_SIZE_B):
@@ -63,14 +63,13 @@ def compute_persistent_grid_dim(kwargs):
     return (num_pid_b * num_pid_h, )
 
 
-def get_persistent_fwd_autotune_configs(pfd: PersistentFwdData):
+def get_persistent_autotune_configs(pfd: PersistentData):
     """
     Be careful here! The setup relies on global state:
     - HIDDEN_SIZE and BATCH_SIZE passed from lstm.py so that no deadlocks occur
     """
     # step 1:
     # restrict to block_sizes_h that lead to non-deadlocked configs
-    print(pfd)
     hidden_block_sizes = []
     for block_size in [8, 16, 32, 64, 128, 256]:
         if triton.cdiv(pfd.HIDDEN_SIZE, block_size) > SM_count:
@@ -81,11 +80,20 @@ def get_persistent_fwd_autotune_configs(pfd: PersistentFwdData):
         hidden_block_sizes += [block_size]
     assert len(hidden_block_sizes) > 0, f"BLOCK_SIZE_H not large enough to support hidden_size {pfd.HIDDEN_SIZE} on {SM_count} many SMs."
 
+    batch_block_sizes = []
+    for block_size in [1, 8, 16, 32, 64, 128]:
+        if (block_size >= 2 * pfd.BATCH_SIZE):
+            continue
+        if block_size == 1 and pfd.BATCH_SIZE >=12:
+            continue
+
+        batch_block_sizes += [block_size]
+
+
     configs =  [
     triton.Config(
             {
                 "BLOCK_SIZE_K": 32,
-                "GROUP_SIZE_B": 8,
             } | compute_batch_layout(hidden_size=pfd.HIDDEN_SIZE,
                                      BLOCK_SIZE_H=h,
                                      batch_size=pfd.BATCH_SIZE,
@@ -96,15 +104,14 @@ def get_persistent_fwd_autotune_configs(pfd: PersistentFwdData):
         for w in [2, 4]
         for s in [2, 4, 6, 8]
         for h in hidden_block_sizes
-        for b in [16, 32, 64, 128]
-        if ((b < 2 * pfd.BATCH_SIZE) or (pfd.BATCH_SIZE < 16 and b == 16))]
+        for b in batch_block_sizes
+    ]
     
     best_sm_ratio = max([c.kwargs["num_pid_b"] * (triton.cdiv(pfd.HIDDEN_SIZE, c.kwargs["BLOCK_SIZE_H"]) ) / SM_count for c in configs])
     # remove configs that utilize too few SMs
     configs = [c for c in configs if c.kwargs["num_pid_b"] * (triton.cdiv(pfd.HIDDEN_SIZE, c.kwargs["BLOCK_SIZE_H"])) / SM_count > 0.75 * best_sm_ratio]
 
     assert len(configs)>0
-    print(f"num_configs: {len(configs)}")
     return configs
 
 
@@ -129,5 +136,4 @@ def get_persistent_fwd_v2_autotune_configs():
                        # (8, 2)
                        ]
     ]
-    print(f"persistent v2: {len(configs)}")
     return configs

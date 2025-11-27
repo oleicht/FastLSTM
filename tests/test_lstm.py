@@ -183,7 +183,6 @@ def test_fastlstm(version, seq_size, batch_size, hidden_size):
     grow with both seq-size and batch-size."""
     if not DEVICE == "cuda":
         pytest.skip("No gpu detected but triton needs it. Test skipped")
-
     input_size = 123
     num_layers = 2
     torch.manual_seed(123)

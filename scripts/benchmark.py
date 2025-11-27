@@ -22,8 +22,8 @@ def generate_configs():
     - hidden_size = [64 ... 2048]
     """
     configs = {}
-    for seq_len, bs, hs, layer in product(range(3, 4), range(5, -1, -1), range(5, -1,-1), range(1)):
-        name = f"s{seq_len}_b{bs}_h{hs}_l{layer}"
+    for bs, hs, layer, seq_len in product(range(5, -1, -1), range(5, -1,-1), range(1), range(4)):
+        name = f"s{64 << seq_len}_b{4 << bs}_h{64 << hs}_l{1 + layer}"
         configs[name] = (64 << seq_len, 4 << bs, 64 << hs, 1 + layer)
 
     return configs
@@ -134,13 +134,13 @@ def run_benchmark(config, models, mode, dtype=None):
 
 
 if __name__ == "__main__":
-    fname = "persistentBasic3"
+    fname = "bench"
     overwrite = True
-    dtype = [None, torch.bfloat16, torch.float16][0]
+    dtype = [None, torch.bfloat16, torch.float16][2]
 
     flstm.TRACK_AUTOTUNE_RUNTIMES = True
 
-    for mode in ["fwd", "full", "bwd"][:1]:
+    for mode in ["fwd", "full", "bwd"][1:2]:
         p = Path(f"{mode}_{fname}.parquet")
         if not overwrite and p.exists():
             raise ValueError(f"File {mode}_{fname} exists")
@@ -150,7 +150,7 @@ if __name__ == "__main__":
             "persistent",
         ]
 
-        if False:
+        if True:
             models += [
                 "cuda",
                 "cuda_fused",
