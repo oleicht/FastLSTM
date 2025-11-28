@@ -79,12 +79,12 @@ def get_persistent_autotune_configs(pfd: PersistentData, fully_fused=False):
 
         hidden_block_sizes += [block_size]
     if fully_fused:
-        hidden_block_sizes = [pfd.HIDDEN_SIZE]
+        hidden_block_sizes = [triton.next_power_of_2(pfd.HIDDEN_SIZE)]
     assert len(hidden_block_sizes) > 0, f"BLOCK_SIZE_H not large enough to support hidden_size {pfd.HIDDEN_SIZE} on {SM_count} many SMs."
 
     k_block_sizes = [32, 64]
     if fully_fused:
-        k_block_sizes = [pfd.HIDDEN_SIZE]
+        k_block_sizes = [triton.next_power_of_2(pfd.HIDDEN_SIZE)]
 
     batch_block_sizes = []
     for block_size in [1, 8, 16, 32, 64, 128]:
@@ -116,7 +116,6 @@ def get_persistent_autotune_configs(pfd: PersistentData, fully_fused=False):
     best_sm_ratio = max([c.kwargs["num_pid_b"] * (triton.cdiv(pfd.HIDDEN_SIZE, c.kwargs["BLOCK_SIZE_H"]) ) / SM_count for c in configs])
     # remove configs that utilize too few SMs
     # configs = [c for c in configs if c.kwargs["num_pid_b"] * (triton.cdiv(pfd.HIDDEN_SIZE, c.kwargs["BLOCK_SIZE_H"])) / SM_count > 0.75 * best_sm_ratio]
-    print(f"n-confs {len(configs)}")
     assert len(configs)>0
     return configs
 

@@ -26,30 +26,36 @@ dtype_str = {
     torch.bfloat16: "bf16",
 }
 
-def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1):
+def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=None):
     torch.cuda.nvtx.range_push("fwd setup")
     if x.dim() == 2:
         x = x[None]
 
+    dtype = dtype_str[x.dtype]
     seq_len, batch_size, input_size = x.shape
     hidden_size = Wh.shape[1]
+
+    if version is None:
+        # should be more general: the idea here is finding out whether W @ x is memory bound too
+        # fp32 -> use fully fused <= 64
+        # half prec; use <= 128
+        if hidden_size <= (1 + dtype.endswith("16")) * 64:
+            version = 3
+        else:
+            version = 1
 
     assert x.is_contiguous()
     assert Wh.is_contiguous()
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("ifgo")
     if version == 3:
-        ifgo = torch.zeros((seq_len, batch_size, 4* hidden_size), device=x.device, dtype=x.dtype)
-        ifgo += (bh + bx)
-
-        # ifgo = torch.addmm(
-        #     bx + bh, x.view(seq_len * batch_size, -1), Wx.T, beta=1.0, alpha=1.0
-        # ).view(seq_len, batch_size, -1)
-
+        ifgo = torch.empty((seq_len, batch_size, 4* hidden_size), device=x.device, dtype=x.dtype)
         extra_args = {
                 "input_size": input_size,
                 "x_ptr": x,
                 "W_x_ptr": Wx,
+                "b_x_ptr": bx,
+                "b_h_ptr": bh,
             }
         
     else:
@@ -117,7 +123,6 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("run kernel")
 
-    dtype = dtype_str[ifgo.dtype]
 
     match version:
         case 1:
