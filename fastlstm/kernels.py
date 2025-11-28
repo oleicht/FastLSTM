@@ -390,10 +390,6 @@ def persistent_fwd_kernel(
         W_h_ptrs = W_h_ptr + (offs_k[:, None] * 1 + offs_bh[None, :] * hidden_size)
 
         for ss in range(seq_len):
-            # it's key to have atomic_adtl.atomic_add(global_sync_ptrl, 1)d and not a normal load here!
-            if ss > 0:
-                while tl.atomic_add(global_sync_ptrl, 0, sem="acquire") < num_pid_h:
-                    pass
 
             i = tl.load(ifgo_ptrs + 0 * hidden_size, mask=mask, other=0.0)
             f = tl.load(ifgo_ptrs + 1 * hidden_size, mask=mask, other=0.0)
@@ -407,6 +403,10 @@ def persistent_fwd_kernel(
 
             # note! it's W_h.T not W_h!!
             # (batch_size, hidden_size) x (hidden_size, 4 x hidden_size)
+
+            if ss > 0:
+                while tl.atomic_add(global_sync_ptrl, 0, sem="acquire") < num_pid_h:
+                    pass
 
             for k in range(k_steps):
                 h_0 = tl.load(
@@ -472,6 +472,171 @@ def persistent_fwd_kernel(
             # update global counter
             global_sync_ptrl += total_num_pid_b
             tl.atomic_add(global_sync_ptrl, 1, sem="release")
+
+        pid_b += num_pid_b
+
+
+@triton.autotune(
+    configs=configs.get_persistent_autotune_configs(configs.ProblemShape, fully_fused=True),
+    key=["batch_size", "hidden_size", "dtype"],
+)
+@triton.jit(do_not_specialize=['seq_len'])
+def fully_fused_persistent_fwd_kernel(
+    ifgo_ptr,
+    x_ptr,
+    cell_ptr,
+    h_ptr,
+    W_h_ptr,
+    W_x_ptr,
+    seq_len,  # : tl.constexpr,
+    global_sync_ptr,
+    batch_chunks: tl.constexpr,
+    num_pid_b: tl.constexpr,
+    batch_size: tl.constexpr,
+    hidden_size: tl.constexpr,
+    input_size: tl.constexpr,
+    BLOCK_SIZE_B: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    dtype: tl.constexpr,
+):
+    total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
+    num_pid_h = tl.cdiv(hidden_size, BLOCK_SIZE_H)
+
+    # old
+    pid = tl.program_id(axis=0)
+    pid_b = pid // num_pid_h
+    pid_h = pid % num_pid_h
+
+    tl.assume(pid_b >= 0)
+    tl.assume(pid_h >= 0)
+    tl.assume(seq_len > 0)
+    tl.assume(hidden_size > 0)
+    tl.assume(batch_size > 0)
+
+    tl.assume(BLOCK_SIZE_B > 0)
+    tl.assume(BLOCK_SIZE_K > 0)
+    tl.assume(BLOCK_SIZE_H > 0)
+
+    if dtype == "fp32":
+        target = tl.float32
+    elif dtype == "fp16":
+        target = tl.float16
+    elif dtype == "bf16":
+        target = tl.bfloat16
+
+    offs_bh = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    w_mask = offs_k[:, None] < input_size
+    # W_x_ptrs = W_x_ptr + (offs_k[:, None] * 1 + offs_bh[None, :] * input_size)
+    # Wx_i = tl.load(W_x_ptrs, mask=w_mask, other=0.0)
+
+    # Wx_f = tl.load(
+    #     W_x_ptrs + input_size * hidden_size, mask=w_mask, other=0.0
+    # )
+    # Wx_g = tl.load(
+    #     W_x_ptrs + 2 * input_size * hidden_size, mask=w_mask, other=0.0
+    # )
+    # Wx_o = tl.load(
+    #     W_x_ptrs + 3 * input_size * hidden_size, mask=w_mask, other=0.0
+    # )
+
+    W_h_ptrs = W_h_ptr + (offs_k[:, None] * 1 + offs_bh[None, :] * hidden_size)
+    Wh_i = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
+        
+    Wh_f = tl.load(
+                W_h_ptrs + hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+    
+    Wh_g = tl.load(
+        W_h_ptrs + 2 * hidden_size * hidden_size, mask=w_mask, other=0.0
+    )
+
+    Wh_o = tl.load(
+        W_h_ptrs + 3 * hidden_size * hidden_size, mask=w_mask, other=0.0
+    )
+
+    for _ in range(batch_chunks):
+        offs_ab = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
+
+        ifgo_ptrs = ifgo_ptr + (
+            offs_ab[:, None] * 4 * hidden_size + offs_bh[None, :] * 1
+        )
+        cell_ptrs = cell_ptr + (offs_ab[:, None] * hidden_size + offs_bh[None, :] * 1)
+        h_write_ptrs = h_ptr + (offs_ab[:, None] * hidden_size + offs_bh[None, :] * 1)
+
+        mask = (offs_ab[:, None] < batch_size) & (offs_bh[None, :] < hidden_size)
+
+        c = tl.load(cell_ptrs, mask=mask, other=0.0)
+        if dtype != "fp32":
+            c = c.cast(tl.float32)
+
+        h_mm_ptrs = h_ptr + (offs_ab[:, None] * hidden_size + offs_k[None, :] * 1)
+        x_mm_ptrs = x_ptr + (offs_ab[:, None] * input_size + offs_k[None, :] * 1)
+
+        h = tl.load(
+            h_mm_ptrs,
+            mask=offs_k[None, :] < hidden_size,
+            other=0.0,
+        )
+        
+        for _ in range(seq_len):
+            i = tl.load(ifgo_ptrs + 0 * hidden_size, mask=mask).cast(tl.float32)
+            f = tl.load(ifgo_ptrs + 1 * hidden_size, mask=mask).cast(tl.float32)
+            g = tl.load(ifgo_ptrs + 2 * hidden_size, mask=mask).cast(tl.float32)
+            o = tl.load(ifgo_ptrs + 3 * hidden_size, mask=mask).cast(tl.float32)
+
+            # i = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
+            # f = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
+            # g = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
+            # o = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
+
+            i = tl.dot(h, Wh_i, i)
+            f = tl.dot(h, Wh_f, f)
+            g = tl.dot(h, Wh_g, g)
+            o = tl.dot(h, Wh_o, o)
+
+
+            # x = tl.load(
+            #         x_mm_ptrs,
+            #         mask=offs_k[None, :] < input_size,
+            #         other=0.0,
+            #     )
+
+            # i = tl.dot(x, Wx_i, i)
+            # f = tl.dot(x, Wx_f, f)
+            # g = tl.dot(x, Wx_g, g)
+            # o = tl.dot(x, Wx_o, o)
+
+            # x_mm_ptrs += batch_size * input_size
+
+            if dtype != "fp32":
+                tl.store(ifgo_ptrs + 0 * hidden_size, i.cast(target), mask=mask)
+                tl.store(ifgo_ptrs + 1 * hidden_size, f.cast(target), mask=mask)
+                tl.store(ifgo_ptrs + 2 * hidden_size, g.cast(target), mask=mask)
+                tl.store(ifgo_ptrs + 3 * hidden_size, o.cast(target), mask=mask)
+            else:
+                tl.store(ifgo_ptrs + 0 * hidden_size, i, mask=mask)
+                tl.store(ifgo_ptrs + 1 * hidden_size, f, mask=mask)
+                tl.store(ifgo_ptrs + 2 * hidden_size, g, mask=mask)
+                tl.store(ifgo_ptrs + 3 * hidden_size, o, mask=mask)
+
+            ifgo_ptrs += batch_size * 4 * hidden_size
+
+            cell_ptrs += batch_size * hidden_size
+            h_write_ptrs += batch_size * hidden_size
+
+            c = tl.sigmoid(f) * c + tl.sigmoid(i) * libdevice.tanh(g)
+            h_tmp = tl.sigmoid(o) * libdevice.tanh(c)
+            if dtype != "fp32":
+                h = h_tmp.cast(target)
+                tl.store(cell_ptrs, c.cast(target), mask=mask)
+                tl.store(h_write_ptrs, h, mask=mask)
+            else:
+                h = h_tmp
+                tl.store(cell_ptrs, c, mask=mask)
+                tl.store(h_write_ptrs, h, mask=mask)
 
         pid_b += num_pid_b
 

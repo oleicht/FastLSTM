@@ -31,16 +31,32 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1
     if x.dim() == 2:
         x = x[None]
 
-    seq_len = x.shape[0]
-    batch_size = x.shape[1]
+    seq_len, batch_size, input_size = x.shape
     hidden_size = Wh.shape[1]
+
     assert x.is_contiguous()
     assert Wh.is_contiguous()
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("ifgo")
-    ifgo = torch.addmm(
-        bx + bh, x.view(seq_len * batch_size, -1), Wx.T, beta=1.0, alpha=1.0
-    ).view(seq_len, batch_size, -1)
+    if version == 3:
+        ifgo = torch.zeros((seq_len, batch_size, 4* hidden_size), device=x.device, dtype=x.dtype)
+        ifgo += (bh + bx)
+
+        # ifgo = torch.addmm(
+        #     bx + bh, x.view(seq_len * batch_size, -1), Wx.T, beta=1.0, alpha=1.0
+        # ).view(seq_len, batch_size, -1)
+
+        extra_args = {
+                "input_size": input_size,
+                "x_ptr": x,
+                "W_x_ptr": Wx,
+            }
+        
+    else:
+        ifgo = torch.addmm(
+            bx + bh, x.view(seq_len * batch_size, -1), Wx.T, beta=1.0, alpha=1.0
+        ).view(seq_len, batch_size, -1)
+        extra_args = {}
 
     assert ifgo.stride(1) == 4 * hidden_size
     assert ifgo.stride(2) == 1
@@ -103,16 +119,25 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1
 
     dtype = dtype_str[ifgo.dtype]
 
-    kernel = kernels.persistent_fwd_kernel_v2 if version==2 else kernels.persistent_fwd_kernel
+    match version:
+        case 1:
+            kernel = kernels.persistent_fwd_kernel
+        case 2:
+            kernel = kernels.persistent_fwd_kernel_v2
+        case 3:
+            kernel = kernels.fully_fused_persistent_fwd_kernel
  
     if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernel.cache):
         # triton.heuristics can't be used here
         # we need to modify the triton.Configs as a function of the inputs which isn't supported
         CurrentShape = configs.PersistentData(BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size)
-        if version==1 and (configs.ProblemShape != CurrentShape):
+        if version in [1, 3] and (configs.ProblemShape != CurrentShape):
             configs.ProblemShape = CurrentShape
             reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
-            kernel = kernels.persistent_fwd_kernel
+            if version == 1:
+                kernel = kernels.persistent_fwd_kernel
+            else:
+                kernel = kernels.fully_fused_persistent_fwd_kernel
 
         kernel[grid](
             ifgo_ptr=torch.randn_like(ifgo),  # ifgo gets overwritten
@@ -124,6 +149,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1
             hidden_size=hidden_size,
             global_sync_ptr=torch.zeros_like(global_sync),
             dtype=dtype_str[ifgo.dtype],
+            **extra_args
         )
         if TRACK_AUTOTUNE_RUNTIMES:
             for k, v in kernel.configs_timings.items():
@@ -139,6 +165,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1
         hidden_size=hidden_size,
         global_sync_ptr=global_sync,
         dtype=dtype,
+        **extra_args
     )
 
     torch.cuda.nvtx.range_pop()
