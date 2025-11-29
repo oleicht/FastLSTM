@@ -95,8 +95,6 @@ def get_persistent_autotune_configs(pfd: PersistentData, fully_fused=False):
 
         batch_block_sizes += [block_size]
 
-    batch_block_sizes = [8]
-
     configs =  [
     triton.Config(
             {
@@ -109,8 +107,8 @@ def get_persistent_autotune_configs(pfd: PersistentData, fully_fused=False):
             num_stages=s,
         )
         for k in k_block_sizes
-        for w in [2]  #  [1, 2, 4, 8]
-        for s in [2]  # [1, 2, 4, 6]
+        for w in [1, 2, 4, 8]
+        for s in [1, 2, 4, 6]
         for h in hidden_block_sizes
         for b in batch_block_sizes
     ]

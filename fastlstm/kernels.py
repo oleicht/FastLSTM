@@ -526,6 +526,7 @@ def fully_fused_persistent_fwd_kernel(
 ):
     tl.device_assert(tl.cdiv(hidden_size, BLOCK_SIZE_H) == 1)
     tl.device_assert(tl.cdiv(max(hidden_size, input_size), BLOCK_SIZE_K) == 1)
+    tl.device_assert(tl.cdiv(batch_size, BLOCK_SIZE_B) <= num_pid_b * batch_chunks)
 
     pid_b = tl.program_id(axis=0)
 
@@ -565,9 +566,9 @@ def fully_fused_persistent_fwd_kernel(
 
     b_mask = offs_bh < hidden_size
     b_i = tl.load(b_x_ptr+offs_bh              , mask=b_mask) + tl.load(b_h_ptr+offs_bh                   , mask=b_mask)
-    b_f = tl.load(b_x_ptr+offs_bh+  hidden_size, mask=b_mask) + tl.load(b_h_ptr+hidden_size * offs_bh     , mask=b_mask)
-    b_g = tl.load(b_x_ptr+offs_bh+2*hidden_size, mask=b_mask) + tl.load(b_h_ptr+2 * +hidden_size * offs_bh, mask=b_mask)
-    b_o = tl.load(b_x_ptr+offs_bh+3*hidden_size, mask=b_mask) + tl.load(b_h_ptr+ 3 * hidden_size * offs_bh, mask=b_mask)
+    b_f = tl.load(b_x_ptr + hidden_size+offs_bh, mask=b_mask) + tl.load(b_h_ptr+hidden_size + offs_bh     , mask=b_mask)
+    b_g = tl.load(b_x_ptr+offs_bh+2*hidden_size, mask=b_mask) + tl.load(b_h_ptr+ 2 * hidden_size + offs_bh, mask=b_mask)
+    b_o = tl.load(b_x_ptr+offs_bh+3*hidden_size, mask=b_mask) + tl.load(b_h_ptr+ 3 * hidden_size + offs_bh, mask=b_mask)
 
     for _ in range(batch_chunks):
         offs_ab = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
@@ -575,19 +576,18 @@ def fully_fused_persistent_fwd_kernel(
         ifgo_ptrs = ifgo_ptr + (
             offs_ab[:, None] * 4 * hidden_size + offs_bh[None, :] * 1
         )
-        cell_ptrs = cell_ptr + (offs_ab[:, None] * hidden_size + offs_bh[None, :] * 1)
-        h_write_ptrs = h_ptr + (offs_ab[:, None] * hidden_size + offs_bh[None, :] * 1)
 
         mask = (offs_ab[:, None] < batch_size) & (offs_bh[None, :] < hidden_size)
-        c = tl.load(cell_ptrs, mask=mask, other=0.0)
 
+        cell_ptrs = cell_ptr + (offs_ab[:, None] * hidden_size + offs_bh[None, :] * 1)
+        c = tl.load(cell_ptrs, mask=mask, other=0.0)
         if dtype != "fp32":
             c = c.cast(tl.float32)
 
-        h_mm_ptrs = h_ptr + (offs_ab[:, None] * hidden_size + offs_k[None, :] * 1)
-        x_mm_ptrs = x_ptr + (offs_ab[:, None] * input_size + offs_k[None, :] * 1)
+        h_ptrs = h_ptr + (offs_ab[:, None] * hidden_size + offs_bh[None, :] * 1)
+        h = tl.load(h_ptrs, mask=mask, other=0.0,)
 
-        h = tl.load(h_mm_ptrs, mask=mask, other=0.0,)
+        x_mm_ptrs = x_ptr + (offs_ab[:, None] * input_size + offs_k[None, :] * 1)
         
         for _ in range(seq_len):
             i = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_i.reshape(1, BLOCK_SIZE_H)
@@ -621,10 +621,10 @@ def fully_fused_persistent_fwd_kernel(
                 tl.store(ifgo_ptrs + 2 * hidden_size, g, mask=mask)
                 tl.store(ifgo_ptrs + 3 * hidden_size, o, mask=mask)
 
-            x_mm_ptrs    += batch_size * input_size
-            ifgo_ptrs    += batch_size * 4 * hidden_size
-            cell_ptrs    += batch_size * hidden_size
-            h_write_ptrs += batch_size * hidden_size
+            ifgo_ptrs += batch_size * 4 * hidden_size
+            x_mm_ptrs += batch_size * input_size
+            cell_ptrs += batch_size * hidden_size
+            h_ptrs    += batch_size * hidden_size
 
             c = tl.sigmoid(f) * c + tl.sigmoid(i) * libdevice.tanh(g)
             h = tl.sigmoid(o) * libdevice.tanh(c)
@@ -632,10 +632,10 @@ def fully_fused_persistent_fwd_kernel(
             if dtype != "fp32":
                 h = h.cast(target)
                 tl.store(cell_ptrs, c.cast(target), mask=mask)
-                tl.store(h_write_ptrs, h, mask=mask)
+                tl.store(h_ptrs, h, mask=mask)
             else:
                 tl.store(cell_ptrs, c, mask=mask)
-                tl.store(h_write_ptrs, h, mask=mask)
+                tl.store(h_ptrs, h, mask=mask)
             tl.debug_barrier()
 
         pid_b += num_pid_b
