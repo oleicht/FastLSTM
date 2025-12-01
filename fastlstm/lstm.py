@@ -27,7 +27,7 @@ dtype_str = {
 }
 
 
-def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=None):
+def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1):
     torch.cuda.nvtx.range_push("fwd setup")
     if x.dim() == 2:
         x = x[None]
@@ -40,11 +40,11 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
         # should be more general: the idea here is finding out whether W @ x is memory bound too
         # fp32 -> use fully fused <= 64
         # half prec; use <= 128
-        if hidden_size <= (1 + dtype.endswith("16")) * 64:
+        if hidden_size <= (1 + dtype.endswith("16")) * 32:
             version = 3
         else:
             version = 1
-
+    assert version == 1
     assert x.is_contiguous()
     assert Wh.is_contiguous()
     torch.cuda.nvtx.range_pop()
@@ -498,125 +498,132 @@ def lstm_graph_bwd(
 
     dh = dh.contiguous()
 
-    assert ifgo.is_contiguous()
-    assert cell.is_contiguous()
-    assert ifgo.shape == (seq_len, batch_size, 4 * hidden_size)
-    assert dh.shape == (seq_len, batch_size, hidden_size)
-    assert cell.shape == (seq_len + 1, batch_size, hidden_size)
-    assert dc_n.shape == (batch_size, hidden_size)
-    assert Wx.shape == (4 * hidden_size, input_size)
+    # assert ifgo.is_contiguous()
+    # assert cell.is_contiguous()
+    # assert ifgo.shape == (seq_len, batch_size, 4 * hidden_size)
+    # assert dh.shape == (seq_len, batch_size, hidden_size)
+    # assert cell.shape == (seq_len + 1, batch_size, hidden_size)
+    # assert dc_n.shape == (batch_size, hidden_size)
+    # assert Wx.shape == (4 * hidden_size, input_size)
 
-    if triton_config is not None:
-        BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-        BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-        BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-        num_warps = triton_config["num_warps"]
-        num_stages = triton_config["num_stages"]
-        overlap_version = triton_config.get("overlap_version", True)
+    # if triton_config is not None:
+    #     BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
+    #     BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
+    #     BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
+    #     num_warps = triton_config["num_warps"]
+    #     num_stages = triton_config["num_stages"]
+    #     overlap_version = triton_config.get("overlap_version", True)
 
-    else:
-        BLOCK_SIZE_H = 32
-        BLOCK_SIZE_B = 32
-        BLOCK_SIZE_K = 64
-        num_warps = 4
-        num_stages = 4
-        overlap_version = True  # makes small problems ~5% faster and large ones <1%
+    # else:
+    #     BLOCK_SIZE_H = 32
+    #     BLOCK_SIZE_B = 32
+    #     BLOCK_SIZE_K = 64
+    #     num_warps = 4
+    #     num_stages = 4
+    #     overlap_version = True  # makes small problems ~5% faster and large ones <1%
 
-    grid = (
-        triton.cdiv(hidden_size, BLOCK_SIZE_H) * triton.cdiv(batch_size, BLOCK_SIZE_B),
-    )
+    # grid1 = (
+    #     triton.cdiv(hidden_size, BLOCK_SIZE_H) * triton.cdiv(batch_size, BLOCK_SIZE_B),
+    # )
+    # point_grid = (
+    #     triton.cdiv(hidden_size, 32),
+    #     triton.cdiv(batch_size, 32),
+    # )
+
     grid = lambda META: (
         triton.cdiv(hidden_size, META["BLOCK_SIZE_H"])
         * triton.cdiv(batch_size, META["BLOCK_SIZE_B"]),
     )
 
-    point_grid = (
-        triton.cdiv(hidden_size, 32),
-        triton.cdiv(batch_size, 32),
-    )
     dtype = dtype_str[ifgo.dtype]
 
-    def run(warmup=True):
-        if overlap_version:
-            kernels.lstm_overlap_bwd[grid](
-                ifgo_ptr=ifgo,
-                cell_ptr=cell,
-                d_c_ptr=dc_n if not warmup else torch.randn_like(dc_n),
-                d_ifgo_ptr=d_ifgo,
-                d_out_ptr=dh,
-                Wh_ptr=Wh,
-                dh_n_ptr=dh_n if not warmup else torch.randn_like(dh_n),
-                hidden_size=hidden_size,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                offset_ptr=offset
-                if not warmup
-                else torch.ones_like(offset),  # don't take first or last for tuning!
-                # BLOCK_SIZE_B=BLOCK_SIZE_B,
-                # BLOCK_SIZE_H=BLOCK_SIZE_H,
-                # BLOCK_SIZE_K=BLOCK_SIZE_K,
-                # GROUP_SIZE_M=8,
-                # num_warps=num_warps,
-                # num_stages=num_stages,
-                dtype=dtype,
-            )
-        if not warmup:
-            offset.add_(-1)
-
-        if not overlap_version:
-            assert not warmup, f"Tuning is not implemented"
-            kernels.lstm_ifgo_bwd[point_grid](
-                d_out_ptr=dh,
-                d_h_ptr=dh_n,
-                cell_ptr=cell,
-                d_c_ptr=dc_n,
-                ifgo_ptr=ifgo,
-                d_ifgo_ptr=d_ifgo,
-                d_ifgo_stride=d_ifgo.stride(0),
-                offset_ptr=offset,
-                batch_size=batch_size,
-                hidden_size=hidden_size,
-                BLOCK_SIZE_H=32,
-                BLOCK_SIZE_B=32,
-                dtype=dtype,
-            )
-            kernels.lstm_h_grad[grid](
-                d_ifgo_ptr=d_ifgo,
-                Wh_ptr=Wh,
-                dh_n_ptr=dh_n,
-                hidden_size=hidden_size,
-                batch_size=batch_size,
-                offset_ptr=offset,
-                BLOCK_SIZE_M=BLOCK_SIZE_H,
-                BLOCK_SIZE_N=BLOCK_SIZE_B,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                GROUP_SIZE_M=8,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                dtype=dtype,
-            )
+    # def run_old():
+    #     offset.add_(-1)
+    #     kernels.lstm_ifgo_bwd[point_grid](
+    #         d_out_ptr=dh,
+    #         d_h_ptr=dh_n,
+    #         cell_ptr=cell,
+    #         d_c_ptr=dc_n,
+    #         ifgo_ptr=ifgo,
+    #         d_ifgo_ptr=d_ifgo,
+    #         d_ifgo_stride=d_ifgo.stride(0),
+    #         offset_ptr=offset,
+    #         batch_size=batch_size,
+    #         hidden_size=hidden_size,
+    #         BLOCK_SIZE_H=32,
+    #         BLOCK_SIZE_B=32,
+    #         dtype=dtype,
+    #     )
+    #     kernels.lstm_h_grad[grid1](
+    #         d_ifgo_ptr=d_ifgo,
+    #         Wh_ptr=Wh,
+    #         dh_n_ptr=dh_n,
+    #         hidden_size=hidden_size,
+    #         batch_size=batch_size,
+    #         offset_ptr=offset,
+    #         BLOCK_SIZE_M=BLOCK_SIZE_H,
+    #         BLOCK_SIZE_N=BLOCK_SIZE_B,
+    #         BLOCK_SIZE_K=BLOCK_SIZE_K,
+    #         GROUP_SIZE_M=8,
+    #         num_warps=num_warps,
+    #         num_stages=num_stages,
+    #         dtype=dtype,
+    #     )
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("graph bwd warmup")
-    run(warmup=True)
-    if TRACK_AUTOTUNE_RUNTIMES:
-        for k, v in kernels.lstm_overlap_bwd.configs_timings.items():
-            CONFIG_RES[f"graphBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [
-                (str(k), v)
-            ]
+    if not any(
+        (batch_size, hidden_size, dtype) == k[:3]
+        for k in kernels.lstm_overlap_bwd.cache
+    ):
+        kernels.lstm_overlap_bwd[grid](
+            ifgo_ptr=ifgo,
+            cell_ptr=cell,
+            d_c_ptr=torch.randn_like(dc_n),
+            d_ifgo_ptr=d_ifgo,
+            d_out_ptr=dh,
+            Wh_ptr=Wh,
+            dh_n_ptr=2 * torch.randn_like(dh_n),
+            hidden_size=hidden_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            offset_ptr=torch.ones_like(offset),
+            dtype=dtype,
+        )
+
+        if TRACK_AUTOTUNE_RUNTIMES:
+            for k, v in kernels.lstm_overlap_bwd.configs_timings.items():
+                CONFIG_RES[f"graphBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                    (str(k), v)
+                ]
 
     torch.cuda.nvtx.range_pop()
-    if seq_len > 1:
-        torch.cuda.nvtx.range_push("graph bwd capture kernel")
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            run(warmup=False)
-        torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("replay kernel")
-        for _ in range(seq_len - 1 + int(overlap_version)):
-            g.replay()
-        torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("graph bwd capture kernel")
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        kernels.lstm_overlap_bwd[grid](
+            ifgo_ptr=ifgo,
+            cell_ptr=cell,
+            d_c_ptr=dc_n,
+            d_ifgo_ptr=d_ifgo,
+            d_out_ptr=dh,
+            Wh_ptr=Wh,
+            dh_n_ptr=dh_n,
+            hidden_size=hidden_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            offset_ptr=offset,
+            dtype=dtype,
+        )
+        offset.add_(-1)
+
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("replay kernel")
+    for _ in range(seq_len + 1):
+        g.replay()
+    torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("matmuls for gradients")
     d_x = d_ifgo @ Wx

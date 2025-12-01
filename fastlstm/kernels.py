@@ -1200,6 +1200,7 @@ def lstm_persistent_seq_bwd(
     BLOCK_SIZE_B: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     dtype: tl.constexpr,
+    LESS_IO: tl.constexpr = False,  # False is the faster vesion
 ):
     pid = tl.program_id(axis=0)
     num_pid_h = tl.cdiv(hidden_size, BLOCK_SIZE_H)
@@ -1209,6 +1210,8 @@ def lstm_persistent_seq_bwd(
         target = tl.float16
     elif dtype == "bf16":
         target = tl.bfloat16
+    else:
+        target = tl.float32
 
     pid_h = pid % num_pid_h
     pid_b = pid // num_pid_h
@@ -1229,42 +1232,55 @@ def lstm_persistent_seq_bwd(
     d_out_ptr += (seq_len - 1) * hidden_size * batch_size
 
     offsets_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)[None]
-    # but we need num_pid_b many
-    #
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
     for _ in range(batch_chunks):
         if pid_b < total_num_pid_b:
             s = sync_ptr + pid_b
+
             offsets_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)[:, None]
-
-            ifgo_indices = offsets_h + 4 * hidden_size * offsets_b
-            c0_indices = offsets_h + hidden_size * offsets_b
-            K = 4 * hidden_size
-            N = hidden_size
-
             c_mask = (offsets_b < batch_size) & (offsets_h < hidden_size)
+            ifgo_indices = offsets_h % hidden_size + 4 * hidden_size * offsets_b
+            c0_indices = offsets_h % hidden_size + hidden_size * offsets_b
 
-            for _ in range(seq_len):
-                i = tl.load(ifgo_ptr + ifgo_indices, mask=c_mask)
-                f = tl.load(ifgo_ptr + ifgo_indices + hidden_size, mask=c_mask)
-                g = tl.load(ifgo_ptr + ifgo_indices + 2 * hidden_size, mask=c_mask)
-                o = tl.load(ifgo_ptr + ifgo_indices + 3 * hidden_size, mask=c_mask)
-
-                c0 = tl.load(cell_ptr + c0_indices, mask=c_mask)
+            if LESS_IO:
+                dh = tl.load(d_h_ptr + c0_indices, mask=c_mask)
+                dc1 = tl.load(d_c_ptr + c0_indices, mask=c_mask)
                 c1 = tl.load(
                     cell_ptr + hidden_size * batch_size + c0_indices, mask=c_mask
                 )
+                if dtype != "fp32":
+                    c1 = c1.cast(tl.float32)
+                    dc1 = dc1.cast(tl.float32)
+            for _ in range(seq_len):
+                i = tl.load(ifgo_ptr + ifgo_indices, mask=c_mask)
+                f = tl.load(
+                    ifgo_ptr + ifgo_indices + hidden_size,
+                    mask=c_mask,
+                )
+                g = tl.load(
+                    ifgo_ptr + ifgo_indices + 2 * hidden_size,
+                    mask=c_mask,
+                )
+                o = tl.load(
+                    ifgo_ptr + ifgo_indices + 3 * hidden_size,
+                    mask=c_mask,
+                )
 
-                dh = tl.load(d_h_ptr + c0_indices, mask=c_mask)
+                c0 = tl.load(cell_ptr + c0_indices, mask=c_mask)
+                if not LESS_IO:
+                    c1 = tl.load(
+                        cell_ptr + hidden_size * batch_size + c0_indices, mask=c_mask
+                    ).cast(tl.float32)
+                    dc1 = tl.load(d_c_ptr + c0_indices, mask=c_mask).cast(tl.float32)
+                    dh = tl.load(d_h_ptr + c0_indices, mask=c_mask).cast(tl.float32)
                 dh += tl.load(d_out_ptr + c0_indices, mask=c_mask)
 
-                dc1 = tl.load(d_c_ptr + c0_indices, mask=c_mask)
                 if dtype != "fp32":
                     i = i.cast(tl.float32)
                     f = f.cast(tl.float32)
                     g = g.cast(tl.float32)
                     o = o.cast(tl.float32)
                     c0 = c0.cast(tl.float32)
-                    c1 = c1.cast(tl.float32)
 
                 dc1 += (
                     dh * tl.sigmoid(o) * (1.0 - libdevice.tanh(c1) * libdevice.tanh(c1))
@@ -1273,7 +1289,6 @@ def lstm_persistent_seq_bwd(
                 d_o = dh * libdevice.tanh(c1) * tl.sigmoid(o) * (1 - tl.sigmoid(o))
 
                 # step 2: c1 = torch.sigmoid(f) * c0 + torch.sigmoid(i) * torch.tanh(g)
-                d_c0 = dc1 * tl.sigmoid(f)
 
                 d_f = dc1 * c0 * tl.sigmoid(f) * (1 - tl.sigmoid(f))
 
@@ -1282,35 +1297,44 @@ def lstm_persistent_seq_bwd(
                 d_g = (
                     dc1 * tl.sigmoid(i) * (1.0 - libdevice.tanh(g) * libdevice.tanh(g))
                 )
+                dc0 = dc1 * tl.sigmoid(f)
+                if LESS_IO:
+                    dc1 = dc0
+                    c1 = c0
                 if dtype != "fp32":
-                    tl.store(
-                        d_ifgo_ptr + ifgo_indices + 3 * hidden_size,
-                        d_o.cast(target),
-                        mask=c_mask,
-                    )
-                    tl.store(d_c_ptr + c0_indices, d_c0.cast(target), mask=c_mask)
+                    tl.store(d_ifgo_ptr + ifgo_indices, d_i.cast(target), mask=c_mask)
                     tl.store(
                         d_ifgo_ptr + ifgo_indices + hidden_size,
                         d_f.cast(target),
                         mask=c_mask,
                     )
-                    tl.store(d_ifgo_ptr + ifgo_indices, d_i.cast(target), mask=c_mask)
                     tl.store(
                         d_ifgo_ptr + ifgo_indices + 2 * hidden_size,
                         d_g.cast(target),
                         mask=c_mask,
                     )
-
-                else:
                     tl.store(
-                        d_ifgo_ptr + ifgo_indices + 3 * hidden_size, d_o, mask=c_mask
+                        d_ifgo_ptr + ifgo_indices + 3 * hidden_size,
+                        d_o.cast(target),
+                        mask=c_mask,
                     )
-                    tl.store(d_c_ptr + c0_indices, d_c0, mask=c_mask)
-                    tl.store(d_ifgo_ptr + ifgo_indices + hidden_size, d_f, mask=c_mask)
+                    if not LESS_IO:
+                        tl.store(
+                            d_c_ptr + c0_indices,
+                            dc0.cast(target),
+                            mask=c_mask,
+                        )
+                else:
                     tl.store(d_ifgo_ptr + ifgo_indices, d_i, mask=c_mask)
+                    tl.store(d_ifgo_ptr + ifgo_indices + hidden_size, d_f, mask=c_mask)
                     tl.store(
                         d_ifgo_ptr + ifgo_indices + 2 * hidden_size, d_g, mask=c_mask
                     )
+                    tl.store(
+                        d_ifgo_ptr + ifgo_indices + 3 * hidden_size, d_o, mask=c_mask
+                    )
+                    if not LESS_IO:
+                        tl.store(d_c_ptr + c0_indices, dc0, mask=c_mask)
 
                 tl.atomic_add(s, 1, sem="release")
                 # before the channel mixing, make sure all channels are ready
@@ -1318,40 +1342,47 @@ def lstm_persistent_seq_bwd(
                     pass
 
                 s += total_num_pid_b
-
-                offs_am = offsets_b % batch_size
-                offs_bn = offsets_h % N
-                offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-                a_ptrs = d_ifgo_ptr + (offs_am * K + offs_k[None, :])
-                b_ptrs = Wh_ptr + (offs_k[:, None] * N + offs_bn)
-                c_ptrs = d_h_ptr + c0_indices
-
                 accumulator = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
-                for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-                    a = tl.load(
-                        a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                K = 4 * hidden_size
+                N = hidden_size
+                Wh_ptrs = Wh_ptr + (offs_k[:, None] * N + (offsets_h % hidden_size))
+                d_ifgo_ptrs = d_ifgo_ptr + (offsets_b * K + offs_k[None, :])
+
+                for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
+                    d = tl.load(
+                        d_ifgo_ptrs,
+                        mask=offs_k[None, :] < K - k * BLOCK_SIZE_K,
+                        other=0.0,
                     )
-                    b = tl.load(
-                        b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    W = tl.load(
+                        Wh_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                     )
                     if dtype != "fp32":
-                        b = b.cast(target)
+                        W = W.cast(target)
 
-                    accumulator = tl.dot(a, b, accumulator)
-                    a_ptrs += BLOCK_SIZE_K
-                    b_ptrs += BLOCK_SIZE_K * N
-                # if you want to fuse an activation in, do it here! should be done in fp32!
-                c = accumulator
+                    accumulator = tl.dot(d, W, accumulator)
+                    d_ifgo_ptrs += BLOCK_SIZE_K
+                    Wh_ptrs += BLOCK_SIZE_K * N
 
-                tl.store(c_ptrs, c, mask=c_mask)
-                tl.debug_barrier()
+                if LESS_IO:
+                    dh = accumulator.cast(target)
+                else:
+                    tl.store(
+                        d_h_ptr + c0_indices, accumulator.cast(target), mask=c_mask
+                    )
 
-                ifgo_ptr -= batch_size * 4 * hidden_size
                 d_ifgo_ptr -= batch_size * 4 * hidden_size
+                ifgo_ptr -= batch_size * 4 * hidden_size
                 cell_ptr -= batch_size * hidden_size
                 d_out_ptr -= batch_size * hidden_size
 
+            if LESS_IO:
+                tl.store(d_h_ptr + c0_indices, dh, mask=c_mask)
+                tl.store(
+                    d_c_ptr + c0_indices,
+                    dc1.cast(target),
+                    mask=c_mask,
+                )
         ifgo_ptr += seq_len * batch_size * 4 * hidden_size
         d_ifgo_ptr += seq_len * batch_size * 4 * hidden_size
         cell_ptr += seq_len * batch_size * hidden_size
@@ -1481,8 +1512,8 @@ def lstm_overlap_bwd(
     #######################################################################
     ################ compute dh_{n-1} using d_ifgo_n ######################
     #######################################################################
-    K = 4 * hidden_size
     pid = tl.program_id(axis=0)
+
     num_pid_m = tl.cdiv(batch_size, BLOCK_SIZE_B)
     num_pid_n = tl.cdiv(hidden_size, BLOCK_SIZE_H)
     num_pid_in_group = GROUP_SIZE_B * num_pid_n
@@ -1493,10 +1524,6 @@ def lstm_overlap_bwd(
     pid_h = (pid % num_pid_in_group) // group_size_m
 
     seq_offset = tl.load(offset_ptr)
-    d_ifgo_ptr += seq_offset * batch_size * 4 * hidden_size
-    N = hidden_size
-    b_ptr = Wh_ptr
-    c_ptr = dh_n_ptr
 
     tl.assume(pid_b >= 0)
     tl.assume(pid_h >= 0)
@@ -1508,22 +1535,22 @@ def lstm_overlap_bwd(
     tl.assume(BLOCK_SIZE_K > 0)
     tl.assume(BLOCK_SIZE_H > 0)
     tl.assume(GROUP_SIZE_B > 0)
-    tl.assume(seq_offset >= 0)
+    # tl.assume(seq_offset >= 0)
+    d_ifgo_ptr += seq_offset * batch_size * 4 * hidden_size
 
-    offs_am = (pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)) % batch_size
-    offs_bn = (pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = d_ifgo_ptr + (offs_am[:, None] * K + offs_k[None, :])
-    b_ptrs = b_ptr + (offs_k[:, None] * N + offs_bn[None, :])
+    K = 4 * hidden_size
+    N = hidden_size
+    offs_am = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
+    offs_bn = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
+    c_ptrs = dh_n_ptr + N * offs_am[:, None] + offs_bn[None, :]
+    c_mask = (offs_am[:, None] < batch_size) & (offs_bn[None, :] < N)
 
-    offs_cm = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
-    offs_cn = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
-    c_ptrs = c_ptr + N * offs_cm[:, None] + offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < batch_size) & (offs_cn[None, :] < N)
     if seq_offset < seq_len:
-        # always accumulate in single precision!
-        accumulator = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = d_ifgo_ptr + (offs_am[:, None] * K + offs_k[None, :])
+        b_ptrs = Wh_ptr + (offs_k[:, None] * N + offs_bn[None, :])
 
+        accumulator = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
@@ -1533,7 +1560,7 @@ def lstm_overlap_bwd(
             accumulator = tl.dot(a, b, accumulator)
             a_ptrs += BLOCK_SIZE_K
             b_ptrs += BLOCK_SIZE_K * N
-        # if you want to fuse an activation in, do it here! should be done in fp32!
+
         dh_n = accumulator
         if dtype != "fp32":
             dh_n = dh_n.cast(target)
@@ -1548,23 +1575,26 @@ def lstm_overlap_bwd(
     #######################################################################
     seq_offset -= 1
     if seq_offset >= 0:
-        d_ifgo_ptr -= batch_size * K
-
         ifgo_indices = offs_am[:, None] * K + offs_bn[None]
         c0_indices = offs_am[:, None] * hidden_size + offs_bn[None]
 
-        ifgo_ptr = ifgo_ptr + seq_offset * 4 * hidden_size * batch_size
+        ifgo_ptr += seq_offset * 4 * hidden_size * batch_size
 
-        i = tl.load(ifgo_ptr + ifgo_indices, mask=c_mask)
-        f = tl.load(ifgo_ptr + ifgo_indices + hidden_size, mask=c_mask)
-        g = tl.load(ifgo_ptr + ifgo_indices + 2 * hidden_size, mask=c_mask)
-        o = tl.load(ifgo_ptr + ifgo_indices + 3 * hidden_size, mask=c_mask)
+        i = tl.load(ifgo_ptr + ifgo_indices, mask=c_mask, cache_modifier=".cv")
+        f = tl.load(
+            ifgo_ptr + ifgo_indices + hidden_size, mask=c_mask, cache_modifier=".cv"
+        )
+        g = tl.load(
+            ifgo_ptr + ifgo_indices + 2 * hidden_size, mask=c_mask, cache_modifier=".cv"
+        )
+        o = tl.load(
+            ifgo_ptr + ifgo_indices + 3 * hidden_size, mask=c_mask, cache_modifier=".cv"
+        )
 
         c0_ptr = cell_ptr + seq_offset * hidden_size * batch_size
-        c1_ptr = cell_ptr + (seq_offset + 1) * hidden_size * batch_size
 
         c0 = tl.load(c0_ptr + c0_indices, mask=c_mask)
-        c1 = tl.load(c1_ptr + c0_indices, mask=c_mask)
+        c1 = tl.load(c0_ptr + hidden_size * batch_size + c0_indices, mask=c_mask)
 
         dh = dh_n + tl.load(
             d_out_ptr + seq_offset * hidden_size * batch_size + c0_indices, mask=c_mask
@@ -1586,23 +1616,33 @@ def lstm_overlap_bwd(
 
         # step 2: c1 = torch.sigmoid(f) * c0 + torch.sigmoid(i) * torch.tanh(g)
         d_c0 = dc1 * tl.sigmoid(f)
-
         d_f = dc1 * c0 * tl.sigmoid(f) * (1 - tl.sigmoid(f))
         d_i = dc1 * libdevice.tanh(g) * tl.sigmoid(i) * (1.0 - tl.sigmoid(i))
         d_g = dc1 * tl.sigmoid(i) * (1.0 - libdevice.tanh(g) * libdevice.tanh(g))
 
+        d_ifgo_ptr -= batch_size * K
         if dtype != "fp32":
-            d_o = d_o.cast(target)
-            d_f = d_f.cast(target)
-            d_i = d_i.cast(target)
-            d_g = d_g.cast(target)
-            d_c0 = d_c0.cast(target)
-
-        tl.store(d_ifgo_ptr + ifgo_indices + 3 * hidden_size, d_o, mask=c_mask)
-        tl.store(d_c_ptr + c0_indices, d_c0, mask=c_mask)
-        tl.store(d_ifgo_ptr + ifgo_indices + hidden_size, d_f, mask=c_mask)
-        tl.store(d_ifgo_ptr + ifgo_indices, d_i, mask=c_mask)
-        tl.store(d_ifgo_ptr + ifgo_indices + 2 * hidden_size, d_g, mask=c_mask)
+            tl.store(d_ifgo_ptr + ifgo_indices, d_i.cast(target), mask=c_mask)
+            tl.store(
+                d_ifgo_ptr + ifgo_indices + hidden_size, d_f.cast(target), mask=c_mask
+            )
+            tl.store(
+                d_ifgo_ptr + ifgo_indices + 2 * hidden_size,
+                d_g.cast(target),
+                mask=c_mask,
+            )
+            tl.store(
+                d_ifgo_ptr + ifgo_indices + 3 * hidden_size,
+                d_o.cast(target),
+                mask=c_mask,
+            )
+            tl.store(d_c_ptr + c0_indices, d_c0, mask=c_mask)
+        else:
+            tl.store(d_ifgo_ptr + ifgo_indices, d_i, mask=c_mask)
+            tl.store(d_ifgo_ptr + ifgo_indices + hidden_size, d_f, mask=c_mask)
+            tl.store(d_ifgo_ptr + ifgo_indices + 2 * hidden_size, d_g, mask=c_mask)
+            tl.store(d_ifgo_ptr + ifgo_indices + 3 * hidden_size, d_o, mask=c_mask)
+            tl.store(d_c_ptr + c0_indices, d_c0, mask=c_mask)
 
 
 @triton.jit
