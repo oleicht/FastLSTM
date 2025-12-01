@@ -423,7 +423,9 @@ def persistent_fwd_kernel(
     BLOCK_SIZE_B: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
+    k_steps: tl.constexpr,
     dtype: tl.constexpr,
+    RELOAD_WEIGHTS: tl.constexpr = False,
 ):
     total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
     num_pid_h = tl.cdiv(hidden_size, BLOCK_SIZE_H)
@@ -458,12 +460,14 @@ def persistent_fwd_kernel(
     elif dtype == "bf16":
         target = tl.bfloat16
 
+    # k_steps = tl.cdiv(hidden_size, BLOCK_SIZE_K)
+    offs_bh = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
     for _ in range(batch_chunks):
         global_sync_ptrl = global_sync_ptr + pid_b
 
         offs_ab = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
-        offs_bh = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
 
         ifgo_ptrs = ifgo_ptr + (
             offs_ab[:, None] * 4 * hidden_size + offs_bh[None, :] * 1
@@ -477,9 +481,40 @@ def persistent_fwd_kernel(
         if dtype != "fp32":
             c = c.cast(tl.float32)
 
-        k_steps = tl.cdiv(hidden_size, BLOCK_SIZE_K)
         h_mm_ptrs = h_ptr + (offs_ab[:, None] * hidden_size + offs_k[None, :] * 1)
+
         W_h_ptrs = W_h_ptr + (offs_k[:, None] * 1 + offs_bh[None, :] * hidden_size)
+
+        if not RELOAD_WEIGHTS:
+            tl.assume(k_steps < 4)
+            w_mask = offs_k[:, None] < hidden_size
+            W_i0 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
+            W_f0 = tl.load(W_h_ptrs + 1 * hidden_size, mask=w_mask, other=0.0)
+            W_g0 = tl.load(W_h_ptrs + 2 * hidden_size, mask=w_mask, other=0.0)
+            W_o0 = tl.load(W_h_ptrs + 4 * hidden_size, mask=w_mask, other=0.0)
+            W_h_ptrs += BLOCK_SIZE_K
+
+        if not RELOAD_WEIGHTS and k_steps > 1:
+            w_mask = offs_k[:, None] < hidden_size - BLOCK_SIZE_K
+            W_i1 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
+            W_f1 = tl.load(W_h_ptrs + 1 * hidden_size, mask=w_mask, other=0.0)
+            W_g1 = tl.load(W_h_ptrs + 2 * hidden_size, mask=w_mask, other=0.0)
+            W_o1 = tl.load(W_h_ptrs + 4 * hidden_size, mask=w_mask, other=0.0)
+            W_h_ptrs += BLOCK_SIZE_K
+        if not RELOAD_WEIGHTS and k_steps > 2:
+            w_mask = offs_k[:, None] < hidden_size - 2 * BLOCK_SIZE_K
+            W_i2 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
+            W_f2 = tl.load(W_h_ptrs + 1 * hidden_size, mask=w_mask, other=0.0)
+            W_g2 = tl.load(W_h_ptrs + 2 * hidden_size, mask=w_mask, other=0.0)
+            W_o2 = tl.load(W_h_ptrs + 4 * hidden_size, mask=w_mask, other=0.0)
+            W_h_ptrs += BLOCK_SIZE_K
+        if not RELOAD_WEIGHTS and k_steps > 3:
+            w_mask = offs_k[:, None] < hidden_size - 3 * BLOCK_SIZE_K
+            W_i3 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
+            W_f3 = tl.load(W_h_ptrs + 1 * hidden_size, mask=w_mask, other=0.0)
+            W_g3 = tl.load(W_h_ptrs + 2 * hidden_size, mask=w_mask, other=0.0)
+            W_o3 = tl.load(W_h_ptrs + 4 * hidden_size, mask=w_mask, other=0.0)
+            W_h_ptrs += BLOCK_SIZE_K
 
         for ss in range(seq_len):
             i = tl.load(ifgo_ptrs + 0 * hidden_size, mask=mask, other=0.0)
@@ -495,41 +530,86 @@ def persistent_fwd_kernel(
             # note! it's W_h.T not W_h!!
             # (batch_size, hidden_size) x (hidden_size, 4 x hidden_size)
 
-            if ss > 0:
+            if ss > 0 and num_pid_h > 1:
                 while tl.atomic_add(global_sync_ptrl, 0, sem="acquire") < num_pid_h:
                     pass
 
-            for k in range(k_steps):
+            if RELOAD_WEIGHTS:
+                for k in range(k_steps):
+                    h_0 = tl.load(
+                        h_mm_ptrs,
+                        mask=offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K,
+                        other=0.0,
+                    )
+                    h_mm_ptrs += BLOCK_SIZE_K
+                    w_mask = offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K
+                    W_i = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
+
+                    W_f = tl.load(
+                        W_h_ptrs + hidden_size * hidden_size, mask=w_mask, other=0.0
+                    )
+                    W_g = tl.load(
+                        W_h_ptrs + 2 * hidden_size * hidden_size, mask=w_mask, other=0.0
+                    )
+                    W_o = tl.load(
+                        W_h_ptrs + 3 * hidden_size * hidden_size, mask=w_mask, other=0.0
+                    )
+                    W_h_ptrs += BLOCK_SIZE_K
+
+                    i = tl.dot(h_0, W_i, i)
+                    f = tl.dot(h_0, W_f, f)
+                    g = tl.dot(h_0, W_g, g)
+                    o = tl.dot(h_0, W_o, o)
+                W_h_ptrs = W_h_ptrs - k_steps * BLOCK_SIZE_K
+
+            else:
+                # compiler wants us to manually unroll the loop
                 h_0 = tl.load(
                     h_mm_ptrs,
-                    mask=offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K,
+                    mask=offs_k[None, :] < hidden_size,
                     other=0.0,
                 )
-
-                w_mask = offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K
-                W_i = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
-
-                W_f = tl.load(
-                    W_h_ptrs + hidden_size * hidden_size, mask=w_mask, other=0.0
-                )
-                W_g = tl.load(
-                    W_h_ptrs + 2 * hidden_size * hidden_size, mask=w_mask, other=0.0
-                )
-                W_o = tl.load(
-                    W_h_ptrs + 3 * hidden_size * hidden_size, mask=w_mask, other=0.0
-                )
-
-                i = tl.dot(h_0, W_i, i)
-                f = tl.dot(h_0, W_f, f)
-                g = tl.dot(h_0, W_g, g)
-                o = tl.dot(h_0, W_o, o)
-
-                h_mm_ptrs += BLOCK_SIZE_K
                 W_h_ptrs += BLOCK_SIZE_K
+                i = tl.dot(h_0, W_i0, i)
+                f = tl.dot(h_0, W_f0, f)
+                g = tl.dot(h_0, W_g0, g)
+                o = tl.dot(h_0, W_o0, o)
+                if k_steps > 1:
+                    h_0 = tl.load(
+                        h_mm_ptrs,
+                        mask=offs_k[None, :] < hidden_size - BLOCK_SIZE_K,
+                        other=0.0,
+                    )
+                    W_h_ptrs += BLOCK_SIZE_K
+                    i = tl.dot(h_0, W_i1, i)
+                    f = tl.dot(h_0, W_f1, f)
+                    g = tl.dot(h_0, W_g1, g)
+                    o = tl.dot(h_0, W_o1, o)
+                if k_steps > 2:
+                    h_0 = tl.load(
+                        h_mm_ptrs,
+                        mask=offs_k[None, :] < hidden_size - 2 * BLOCK_SIZE_K,
+                        other=0.0,
+                    )
+                    W_h_ptrs += BLOCK_SIZE_K
+                    i = tl.dot(h_0, W_i2, i)
+                    f = tl.dot(h_0, W_f2, f)
+                    g = tl.dot(h_0, W_g2, g)
+                    o = tl.dot(h_0, W_o2, o)
+                if k_steps > 3:
+                    h_0 = tl.load(
+                        h_mm_ptrs,
+                        mask=offs_k[None, :] < hidden_size - 3 * BLOCK_SIZE_K,
+                        other=0.0,
+                    )
+                    W_h_ptrs += BLOCK_SIZE_K
+                    i = tl.dot(h_0, W_i3, i)
+                    f = tl.dot(h_0, W_f3, f)
+                    g = tl.dot(h_0, W_g3, g)
+                    o = tl.dot(h_0, W_o3, o)
 
             # reset accumulator pointers for next iteration
             h_mm_ptrs = h_mm_ptrs - k_steps * BLOCK_SIZE_K + batch_size * hidden_size
-            W_h_ptrs = W_h_ptrs - k_steps * BLOCK_SIZE_K
 
             if dtype != "fp32":
                 tl.store(ifgo_ptrs + 0 * hidden_size, i.cast(target), mask=mask)
@@ -673,18 +753,10 @@ def fully_fused_persistent_fwd_kernel(
         x_mm_ptrs = x_ptr + (offs_ab[:, None] * input_size + offs_k[None, :] * 1)
 
         for _ in range(seq_len):
-            i = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_i.reshape(
-                1, BLOCK_SIZE_H
-            )
-            f = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_f.reshape(
-                1, BLOCK_SIZE_H
-            )
-            g = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_g.reshape(
-                1, BLOCK_SIZE_H
-            )
-            o = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_o.reshape(
-                1, BLOCK_SIZE_H
-            )
+            i = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_i
+            f = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_f
+            g = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_g
+            o = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_o
 
             i = tl.dot(h, Wh_i, i)
             f = tl.dot(h, Wh_f, f)
@@ -727,7 +799,6 @@ def fully_fused_persistent_fwd_kernel(
             else:
                 tl.store(cell_ptrs, c, mask=mask)
                 tl.store(h_ptrs, h, mask=mask)
-            tl.debug_barrier()
 
         pid_b += num_pid_b
 
