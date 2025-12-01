@@ -5,6 +5,8 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from fastlstm import configs
+
+
 #######################################################################################
 #################################### fwd kernels ######################################
 #######################################################################################
@@ -140,7 +142,7 @@ def one_step_fwd(
     configs=configs.get_persistent_fwd_v2_autotune_configs(),
     key=["batch_size", "hidden_size", "dtype"],
 )
-@triton.jit(do_not_specialize=['seq_len'])
+@triton.jit(do_not_specialize=["seq_len"])
 def persistent_fwd_kernel_v2(
     ifgo_ptr,
     cell_ptr,
@@ -155,14 +157,13 @@ def persistent_fwd_kernel_v2(
     BLOCK_SIZE_B: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
-    dtype:  tl.constexpr
+    dtype: tl.constexpr,
 ):
     if dtype == "fp16":
         target = tl.float16
 
     elif dtype == "bf16":
         target = tl.bfloat16
-
 
     total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
     total_num_pid_h = tl.cdiv(hidden_size, BLOCK_SIZE_H)
@@ -181,45 +182,61 @@ def persistent_fwd_kernel_v2(
         global_sync_ptrl = global_sync_ptr + pb
 
         for sid in range(seq_len):
-            if sid > 0 and num_pid_h>1:
+            if sid > 0 and num_pid_h > 1:
                 while tl.atomic_add(global_sync_ptrl, 0, sem="acquire") < num_pid_h:
                     pass
 
             # loop over hidden patches
             for ph in range(pid_h, total_num_pid_h, num_pid_h):
-                i_ptrs = tl.make_block_ptr(ifgo_ptr + sid * batch_hidden_4,
-                                           (batch_size, 4, hidden_size),
-                                           (hidden_4, hidden_size, 1),
-                                           (pb*BLOCK_SIZE_B, 0, ph*BLOCK_SIZE_H),
-                                           (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
-                                           (0, 1, 2))
-                i = tl.load(i_ptrs, boundary_check=(0, 2)).reshape(BLOCK_SIZE_B, BLOCK_SIZE_H)
+                i_ptrs = tl.make_block_ptr(
+                    ifgo_ptr + sid * batch_hidden_4,
+                    (batch_size, 4, hidden_size),
+                    (hidden_4, hidden_size, 1),
+                    (pb * BLOCK_SIZE_B, 0, ph * BLOCK_SIZE_H),
+                    (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                    (0, 1, 2),
+                )
+                i = tl.load(i_ptrs, boundary_check=(0, 2)).reshape(
+                    BLOCK_SIZE_B, BLOCK_SIZE_H
+                )
 
-                f_ptrs = tl.make_block_ptr(ifgo_ptr + sid * batch_hidden_4,
-                                           (batch_size, 4, hidden_size),
-                                           (hidden_4, hidden_size, 1),
-                                           (pb*BLOCK_SIZE_B, 1, ph*BLOCK_SIZE_H),
-                                           (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
-                                           (0, 1, 2))
-                f = tl.load(f_ptrs, boundary_check=(0, 2)).reshape(BLOCK_SIZE_B, BLOCK_SIZE_H)
+                f_ptrs = tl.make_block_ptr(
+                    ifgo_ptr + sid * batch_hidden_4,
+                    (batch_size, 4, hidden_size),
+                    (hidden_4, hidden_size, 1),
+                    (pb * BLOCK_SIZE_B, 1, ph * BLOCK_SIZE_H),
+                    (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                    (0, 1, 2),
+                )
+                f = tl.load(f_ptrs, boundary_check=(0, 2)).reshape(
+                    BLOCK_SIZE_B, BLOCK_SIZE_H
+                )
 
-                g_ptrs = tl.make_block_ptr(ifgo_ptr + sid * batch_hidden_4,
-                                           (batch_size, 4, hidden_size),
-                                           (hidden_4, hidden_size, 1),
-                                           (pb*BLOCK_SIZE_B, 2, ph*BLOCK_SIZE_H),
-                                           (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
-                                           (0, 1, 2))
+                g_ptrs = tl.make_block_ptr(
+                    ifgo_ptr + sid * batch_hidden_4,
+                    (batch_size, 4, hidden_size),
+                    (hidden_4, hidden_size, 1),
+                    (pb * BLOCK_SIZE_B, 2, ph * BLOCK_SIZE_H),
+                    (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                    (0, 1, 2),
+                )
 
-                g = tl.load(g_ptrs, boundary_check=(0, 2)).reshape(BLOCK_SIZE_B, BLOCK_SIZE_H)
+                g = tl.load(g_ptrs, boundary_check=(0, 2)).reshape(
+                    BLOCK_SIZE_B, BLOCK_SIZE_H
+                )
 
-                o_ptrs = tl.make_block_ptr(ifgo_ptr + sid * batch_hidden_4,
-                                           (batch_size, 4, hidden_size),
-                                           (hidden_4, hidden_size, 1),
-                                           (pb*BLOCK_SIZE_B, 3, ph*BLOCK_SIZE_H),
-                                           (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
-                                           (0, 1, 2))
+                o_ptrs = tl.make_block_ptr(
+                    ifgo_ptr + sid * batch_hidden_4,
+                    (batch_size, 4, hidden_size),
+                    (hidden_4, hidden_size, 1),
+                    (pb * BLOCK_SIZE_B, 3, ph * BLOCK_SIZE_H),
+                    (BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                    (0, 1, 2),
+                )
 
-                o = tl.load(o_ptrs, boundary_check=(0, 2)).reshape(BLOCK_SIZE_B, BLOCK_SIZE_H)
+                o = tl.load(o_ptrs, boundary_check=(0, 2)).reshape(
+                    BLOCK_SIZE_B, BLOCK_SIZE_H
+                )
                 # note! it's W_h.T not W_h!!
                 # (batch_size, hidden_size) x (hidden_size, 4 x hidden_size)
                 if dtype != "fp32":
@@ -229,48 +246,65 @@ def persistent_fwd_kernel_v2(
                     o = o.cast(tl.float32)
 
                 for k in range(tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-                    h_mm_ptrs = tl.make_block_ptr(h_ptr+sid * batch_size * hidden_size,
-                                                  (batch_size, hidden_size),
-                                                  (hidden_size, 1),
-                                                  (pb*BLOCK_SIZE_B, k * BLOCK_SIZE_K),
-                                                  (BLOCK_SIZE_B, BLOCK_SIZE_K),
-                                                  (0, 1))
+                    h_mm_ptrs = tl.make_block_ptr(
+                        h_ptr + sid * batch_size * hidden_size,
+                        (batch_size, hidden_size),
+                        (hidden_size, 1),
+                        (pb * BLOCK_SIZE_B, k * BLOCK_SIZE_K),
+                        (BLOCK_SIZE_B, BLOCK_SIZE_K),
+                        (0, 1),
+                    )
 
-                    h_0 = tl.load(
-                        h_mm_ptrs, boundary_check=(0, 1))
+                    h_0 = tl.load(h_mm_ptrs, boundary_check=(0, 1))
 
-                    W_i_ptr = tl.make_block_ptr(W_h_ptr,
-                                                (hidden_size, hidden_size, 4),
-                                                (1, hidden_size, hidden_size * hidden_size),
-                                                (k * BLOCK_SIZE_K, ph*BLOCK_SIZE_H, 0),
-                                                (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
-                                                (2, 1, 0))
+                    W_i_ptr = tl.make_block_ptr(
+                        W_h_ptr,
+                        (hidden_size, hidden_size, 4),
+                        (1, hidden_size, hidden_size * hidden_size),
+                        (k * BLOCK_SIZE_K, ph * BLOCK_SIZE_H, 0),
+                        (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
+                        (2, 1, 0),
+                    )
 
-                    W_i = tl.load(W_i_ptr, boundary_check=(1, 2)).reshape(BLOCK_SIZE_K, BLOCK_SIZE_H)
+                    W_i = tl.load(W_i_ptr, boundary_check=(1, 2)).reshape(
+                        BLOCK_SIZE_K, BLOCK_SIZE_H
+                    )
 
-                    W_f_ptr = tl.make_block_ptr(W_h_ptr,
-                                                (hidden_size, hidden_size, 4),
-                                                (1, hidden_size, hidden_size * hidden_size),
-                                                (k * BLOCK_SIZE_K, ph*BLOCK_SIZE_H, 1),
-                                                (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
-                                                (2, 1, 0))
-                    W_f = tl.load(W_f_ptr, boundary_check=(1, 2)).reshape(BLOCK_SIZE_K, BLOCK_SIZE_H)
+                    W_f_ptr = tl.make_block_ptr(
+                        W_h_ptr,
+                        (hidden_size, hidden_size, 4),
+                        (1, hidden_size, hidden_size * hidden_size),
+                        (k * BLOCK_SIZE_K, ph * BLOCK_SIZE_H, 1),
+                        (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
+                        (2, 1, 0),
+                    )
+                    W_f = tl.load(W_f_ptr, boundary_check=(1, 2)).reshape(
+                        BLOCK_SIZE_K, BLOCK_SIZE_H
+                    )
 
-                    W_g_ptr = tl.make_block_ptr(W_h_ptr,
-                                                (hidden_size, hidden_size, 4),
-                                                (1, hidden_size, hidden_size * hidden_size),
-                                                (k * BLOCK_SIZE_K, ph*BLOCK_SIZE_H, 2),
-                                                (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
-                                                (2, 1, 0))
-                    W_g = tl.load(W_g_ptr, boundary_check=(1, 2)).reshape(BLOCK_SIZE_K, BLOCK_SIZE_H)
+                    W_g_ptr = tl.make_block_ptr(
+                        W_h_ptr,
+                        (hidden_size, hidden_size, 4),
+                        (1, hidden_size, hidden_size * hidden_size),
+                        (k * BLOCK_SIZE_K, ph * BLOCK_SIZE_H, 2),
+                        (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
+                        (2, 1, 0),
+                    )
+                    W_g = tl.load(W_g_ptr, boundary_check=(1, 2)).reshape(
+                        BLOCK_SIZE_K, BLOCK_SIZE_H
+                    )
 
-                    W_o_ptr = tl.make_block_ptr(W_h_ptr,
-                                                (hidden_size, hidden_size, 4),
-                                                (1, hidden_size, hidden_size * hidden_size),
-                                                (k * BLOCK_SIZE_K, ph*BLOCK_SIZE_H, 3),
-                                                (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
-                                                (2, 1, 0))
-                    W_o = tl.load(W_o_ptr, boundary_check=(1, 2)).reshape(BLOCK_SIZE_K, BLOCK_SIZE_H)
+                    W_o_ptr = tl.make_block_ptr(
+                        W_h_ptr,
+                        (hidden_size, hidden_size, 4),
+                        (1, hidden_size, hidden_size * hidden_size),
+                        (k * BLOCK_SIZE_K, ph * BLOCK_SIZE_H, 3),
+                        (BLOCK_SIZE_K, BLOCK_SIZE_H, 1),
+                        (2, 1, 0),
+                    )
+                    W_o = tl.load(W_o_ptr, boundary_check=(1, 2)).reshape(
+                        BLOCK_SIZE_K, BLOCK_SIZE_H
+                    )
 
                     i = tl.dot(h_0, W_i, i)
                     f = tl.dot(h_0, W_f, f)
@@ -279,41 +313,78 @@ def persistent_fwd_kernel_v2(
 
                 # reset accumulator pointers for next iteration
                 if dtype != "fp32":
-                    tl.store(i_ptrs, i.cast(target).reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
-                    tl.store(f_ptrs, f.cast(target).reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
-                    tl.store(g_ptrs, g.cast(target).reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
-                    tl.store(o_ptrs, o.cast(target).reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
+                    tl.store(
+                        i_ptrs,
+                        i.cast(target).reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                        boundary_check=(0, 2),
+                    )
+                    tl.store(
+                        f_ptrs,
+                        f.cast(target).reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                        boundary_check=(0, 2),
+                    )
+                    tl.store(
+                        g_ptrs,
+                        g.cast(target).reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                        boundary_check=(0, 2),
+                    )
+                    tl.store(
+                        o_ptrs,
+                        o.cast(target).reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                        boundary_check=(0, 2),
+                    )
                 else:
-                    tl.store(i_ptrs, i.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
-                    tl.store(f_ptrs, f.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
-                    tl.store(g_ptrs, g.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
-                    tl.store(o_ptrs, o.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H), boundary_check=(0, 2))
+                    tl.store(
+                        i_ptrs,
+                        i.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                        boundary_check=(0, 2),
+                    )
+                    tl.store(
+                        f_ptrs,
+                        f.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                        boundary_check=(0, 2),
+                    )
+                    tl.store(
+                        g_ptrs,
+                        g.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                        boundary_check=(0, 2),
+                    )
+                    tl.store(
+                        o_ptrs,
+                        o.reshape(BLOCK_SIZE_B, 1, BLOCK_SIZE_H),
+                        boundary_check=(0, 2),
+                    )
 
                 # step 2: compute c and h
                 # update the pointers first, so the write goes to i+1 element
-                cell_ptrs = tl.make_block_ptr(cell_ptr+sid * batch_size * hidden_size,
-                                              (batch_size, hidden_size),
-                                              (hidden_size, 1),
-                                              (pb*BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
-                                              (BLOCK_SIZE_B, BLOCK_SIZE_H),
-                                              (0, 1))
+                cell_ptrs = tl.make_block_ptr(
+                    cell_ptr + sid * batch_size * hidden_size,
+                    (batch_size, hidden_size),
+                    (hidden_size, 1),
+                    (pb * BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
+                    (BLOCK_SIZE_B, BLOCK_SIZE_H),
+                    (0, 1),
+                )
 
                 c = tl.load(cell_ptrs, boundary_check=(0, 1))
 
+                h_write_ptrs = tl.make_block_ptr(
+                    h_ptr + (sid + 1) * batch_size * hidden_size,
+                    (batch_size, hidden_size),
+                    (hidden_size, 1),
+                    (pb * BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
+                    (BLOCK_SIZE_B, BLOCK_SIZE_H),
+                    (0, 1),
+                )
 
-                h_write_ptrs = tl.make_block_ptr(h_ptr+(sid+1) * batch_size * hidden_size,
-                                                 (batch_size, hidden_size),
-                                                 (hidden_size, 1),
-                                                 (pb*BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
-                                                 (BLOCK_SIZE_B, BLOCK_SIZE_H),
-                                                 (0, 1))
-
-                cell_ptrs = tl.make_block_ptr(cell_ptr+(sid+1) * batch_size * hidden_size,
-                                              (batch_size, hidden_size),
-                                              (hidden_size, 1),
-                                              (pb*BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
-                                              (BLOCK_SIZE_B, BLOCK_SIZE_H),
-                                              (0, 1))
+                cell_ptrs = tl.make_block_ptr(
+                    cell_ptr + (sid + 1) * batch_size * hidden_size,
+                    (batch_size, hidden_size),
+                    (hidden_size, 1),
+                    (pb * BLOCK_SIZE_B, ph * BLOCK_SIZE_H),
+                    (BLOCK_SIZE_B, BLOCK_SIZE_H),
+                    (0, 1),
+                )
 
                 c = tl.sigmoid(f) * c + tl.sigmoid(i) * libdevice.tanh(g)
                 h = tl.sigmoid(o) * libdevice.tanh(c)
@@ -328,17 +399,16 @@ def persistent_fwd_kernel_v2(
             # synchronize within block -> h vector is updated
             tl.debug_barrier(sem="release")
             # update global counter
-            if num_pid_h>1:
+            if num_pid_h > 1:
                 global_sync_ptrl += total_num_pid_b
                 tl.atomic_add(global_sync_ptrl, 1, sem="release")
-
 
 
 @triton.autotune(
     configs=configs.get_persistent_autotune_configs(configs.ProblemShape),
     key=["batch_size", "hidden_size", "dtype"],
 )
-@triton.jit(do_not_specialize=['seq_len'])
+@triton.jit(do_not_specialize=["seq_len"])
 def persistent_fwd_kernel(
     ifgo_ptr,
     cell_ptr,
@@ -412,7 +482,6 @@ def persistent_fwd_kernel(
         W_h_ptrs = W_h_ptr + (offs_k[:, None] * 1 + offs_bh[None, :] * hidden_size)
 
         for ss in range(seq_len):
-
             i = tl.load(ifgo_ptrs + 0 * hidden_size, mask=mask, other=0.0)
             f = tl.load(ifgo_ptrs + 1 * hidden_size, mask=mask, other=0.0)
             g = tl.load(ifgo_ptrs + 2 * hidden_size, mask=mask, other=0.0)
@@ -499,10 +568,12 @@ def persistent_fwd_kernel(
 
 
 @triton.autotune(
-    configs=configs.get_persistent_autotune_configs(configs.ProblemShape, fully_fused=True),
+    configs=configs.get_persistent_autotune_configs(
+        configs.ProblemShape, fully_fused=True
+    ),
     key=["batch_size", "hidden_size", "dtype"],
 )
-@triton.jit(do_not_specialize=['seq_len'])
+@triton.jit(do_not_specialize=["seq_len"])
 def fully_fused_persistent_fwd_kernel(
     ifgo_ptr,
     x_ptr,
@@ -552,23 +623,31 @@ def fully_fused_persistent_fwd_kernel(
 
     W_x_ptrs = W_x_ptr + (offs_k[:, None] * 1 + offs_bh[None, :] * input_size)
     w_mask = (offs_k[:, None] < input_size) & (offs_bh[None, :] < hidden_size)
-    Wx_i = tl.load(W_x_ptrs                               , mask=w_mask, other=0.0)
-    Wx_f = tl.load(W_x_ptrs +     input_size * hidden_size, mask=w_mask, other=0.0)
+    Wx_i = tl.load(W_x_ptrs, mask=w_mask, other=0.0)
+    Wx_f = tl.load(W_x_ptrs + input_size * hidden_size, mask=w_mask, other=0.0)
     Wx_g = tl.load(W_x_ptrs + 2 * input_size * hidden_size, mask=w_mask, other=0.0)
     Wx_o = tl.load(W_x_ptrs + 3 * input_size * hidden_size, mask=w_mask, other=0.0)
 
     W_h_ptrs = W_h_ptr + (offs_k[:, None] * 1 + offs_bh[None, :] * hidden_size)
     w_mask = (offs_k[:, None] < hidden_size) & (offs_bh[None, :] < hidden_size)
-    Wh_i = tl.load(W_h_ptrs, mask=w_mask, other=0.0)        
+    Wh_i = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
     Wh_f = tl.load(W_h_ptrs + hidden_size * hidden_size, mask=w_mask, other=0.0)
     Wh_g = tl.load(W_h_ptrs + 2 * hidden_size * hidden_size, mask=w_mask, other=0.0)
     Wh_o = tl.load(W_h_ptrs + 3 * hidden_size * hidden_size, mask=w_mask, other=0.0)
 
     b_mask = offs_bh < hidden_size
-    b_i = tl.load(b_x_ptr+offs_bh              , mask=b_mask) + tl.load(b_h_ptr+offs_bh                   , mask=b_mask)
-    b_f = tl.load(b_x_ptr + hidden_size+offs_bh, mask=b_mask) + tl.load(b_h_ptr+hidden_size + offs_bh     , mask=b_mask)
-    b_g = tl.load(b_x_ptr+offs_bh+2*hidden_size, mask=b_mask) + tl.load(b_h_ptr+ 2 * hidden_size + offs_bh, mask=b_mask)
-    b_o = tl.load(b_x_ptr+offs_bh+3*hidden_size, mask=b_mask) + tl.load(b_h_ptr+ 3 * hidden_size + offs_bh, mask=b_mask)
+    b_i = tl.load(b_x_ptr + offs_bh, mask=b_mask) + tl.load(
+        b_h_ptr + offs_bh, mask=b_mask
+    )
+    b_f = tl.load(b_x_ptr + hidden_size + offs_bh, mask=b_mask) + tl.load(
+        b_h_ptr + hidden_size + offs_bh, mask=b_mask
+    )
+    b_g = tl.load(b_x_ptr + offs_bh + 2 * hidden_size, mask=b_mask) + tl.load(
+        b_h_ptr + 2 * hidden_size + offs_bh, mask=b_mask
+    )
+    b_o = tl.load(b_x_ptr + offs_bh + 3 * hidden_size, mask=b_mask) + tl.load(
+        b_h_ptr + 3 * hidden_size + offs_bh, mask=b_mask
+    )
 
     for _ in range(batch_chunks):
         offs_ab = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
@@ -585,15 +664,27 @@ def fully_fused_persistent_fwd_kernel(
             c = c.cast(tl.float32)
 
         h_ptrs = h_ptr + (offs_ab[:, None] * hidden_size + offs_bh[None, :] * 1)
-        h = tl.load(h_ptrs, mask=mask, other=0.0,)
+        h = tl.load(
+            h_ptrs,
+            mask=mask,
+            other=0.0,
+        )
 
         x_mm_ptrs = x_ptr + (offs_ab[:, None] * input_size + offs_k[None, :] * 1)
-        
+
         for _ in range(seq_len):
-            i = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_i.reshape(1, BLOCK_SIZE_H)
-            f = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_f.reshape(1, BLOCK_SIZE_H)
-            g = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_g.reshape(1, BLOCK_SIZE_H)
-            o = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_o.reshape(1, BLOCK_SIZE_H)
+            i = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_i.reshape(
+                1, BLOCK_SIZE_H
+            )
+            f = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_f.reshape(
+                1, BLOCK_SIZE_H
+            )
+            g = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_g.reshape(
+                1, BLOCK_SIZE_H
+            )
+            o = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32) + b_o.reshape(
+                1, BLOCK_SIZE_H
+            )
 
             i = tl.dot(h, Wh_i, i)
             f = tl.dot(h, Wh_f, f)
@@ -601,10 +692,10 @@ def fully_fused_persistent_fwd_kernel(
             o = tl.dot(h, Wh_o, o)
 
             x = tl.load(
-                    x_mm_ptrs,
-                    mask=(offs_ab[:, None]  < batch_size) & (offs_k[None, :] < input_size),
-                    other=0.0,
-                )
+                x_mm_ptrs,
+                mask=(offs_ab[:, None] < batch_size) & (offs_k[None, :] < input_size),
+                other=0.0,
+            )
             i = tl.dot(x, Wx_i, i)
             f = tl.dot(x, Wx_f, f)
             g = tl.dot(x, Wx_g, g)
@@ -624,7 +715,7 @@ def fully_fused_persistent_fwd_kernel(
             ifgo_ptrs += batch_size * 4 * hidden_size
             x_mm_ptrs += batch_size * input_size
             cell_ptrs += batch_size * hidden_size
-            h_ptrs    += batch_size * hidden_size
+            h_ptrs += batch_size * hidden_size
 
             c = tl.sigmoid(f) * c + tl.sigmoid(i) * libdevice.tanh(g)
             h = tl.sigmoid(o) * libdevice.tanh(c)
@@ -1038,7 +1129,7 @@ def lstm_persistent_seq_bwd(
     BLOCK_SIZE_B: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     dtype: tl.constexpr,
-    ):
+):
     pid = tl.program_id(axis=0)
     num_pid_h = tl.cdiv(hidden_size, BLOCK_SIZE_H)
     total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
@@ -1277,8 +1368,11 @@ def lstm_full_Wgrad(
     if pid_n == 0:
         tl.store(db_ptr + offs_cm, db, mask=offs_cm < M)
 
-@triton.autotune(configs=configs.get_graph_autotune_configs(),
-                 key=["batch_size", "hidden_size", "dtype"],)
+
+@triton.autotune(
+    configs=configs.get_graph_autotune_configs(),
+    key=["batch_size", "hidden_size", "dtype"],
+)
 @triton.jit
 def lstm_overlap_bwd(
     ifgo_ptr,

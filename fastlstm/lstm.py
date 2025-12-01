@@ -26,6 +26,7 @@ dtype_str = {
     torch.bfloat16: "bf16",
 }
 
+
 def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=None):
     torch.cuda.nvtx.range_push("fwd setup")
     if x.dim() == 2:
@@ -49,15 +50,17 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("ifgo")
     if version == 3:
-        ifgo = torch.empty((seq_len, batch_size, 4* hidden_size), device=x.device, dtype=x.dtype)
+        ifgo = torch.empty(
+            (seq_len, batch_size, 4 * hidden_size), device=x.device, dtype=x.dtype
+        )
         extra_args = {
-                "input_size": input_size,
-                "x_ptr": x,
-                "W_x_ptr": Wx,
-                "b_x_ptr": bx,
-                "b_h_ptr": bh,
-            }
-        
+            "input_size": input_size,
+            "x_ptr": x,
+            "W_x_ptr": Wx,
+            "b_x_ptr": bx,
+            "b_h_ptr": bh,
+        }
+
     else:
         ifgo = torch.addmm(
             bx + bh, x.view(seq_len * batch_size, -1), Wx.T, beta=1.0, alpha=1.0
@@ -112,17 +115,15 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
     #     num_warps = triton_config["num_warps"]
     #     num_stages = triton_config["num_stages"]
 
-
-    grid = configs.compute_persistent_grid_dim 
+    grid = configs.compute_persistent_grid_dim
     global_sync = torch.zeros(
-            seq_len * batch_size,
+        seq_len * batch_size,
         dtype=torch.int,
         device=x.device,
     )
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("run kernel")
-
 
     match version:
         case 1:
@@ -131,11 +132,13 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
             kernel = kernels.persistent_fwd_kernel_v2
         case 3:
             kernel = kernels.fully_fused_persistent_fwd_kernel
- 
+
     if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernel.cache):
         # triton.heuristics can't be used here
         # we need to modify the triton.Configs as a function of the inputs which isn't supported
-        CurrentShape = configs.PersistentData(BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size)
+        CurrentShape = configs.PersistentData(
+            BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size
+        )
         if version in [1, 3] and (configs.ProblemShape != CurrentShape):
             configs.ProblemShape = CurrentShape
             reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
@@ -154,12 +157,14 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
             hidden_size=hidden_size,
             global_sync_ptr=torch.zeros_like(global_sync),
             dtype=dtype_str[ifgo.dtype],
-            **extra_args
+            **extra_args,
         )
         if TRACK_AUTOTUNE_RUNTIMES:
             for k, v in kernel.configs_timings.items():
-                CONFIG_RES[f"persistent-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
-    
+                CONFIG_RES[f"persistent-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                    (str(k), v)
+                ]
+
     kernel[grid](
         ifgo_ptr=ifgo,
         cell_ptr=cell,
@@ -170,7 +175,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
         hidden_size=hidden_size,
         global_sync_ptr=global_sync,
         dtype=dtype,
-        **extra_args
+        **extra_args,
     )
 
     torch.cuda.nvtx.range_pop()
@@ -229,7 +234,6 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     #     num_warps = 4
     #     num_stages = 6
 
-
     # else:
     #     BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
     #     BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
@@ -242,7 +246,8 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     # )
 
     grid = lambda META: (
-        triton.cdiv(batch_size, META["BLOCK_SIZE_B"]) * triton.cdiv(hidden_size, META["BLOCK_SIZE_H"]),
+        triton.cdiv(batch_size, META["BLOCK_SIZE_B"])
+        * triton.cdiv(hidden_size, META["BLOCK_SIZE_H"]),
     )
 
     torch.cuda.nvtx.range_pop()
@@ -252,7 +257,9 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     dtype = dtype_str[ifgo.dtype]
 
     # if the config hasn't run yet: autotune the kernel
-    if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernels.one_step_fwd.cache):
+    if not any(
+        (batch_size, hidden_size, dtype) == k[:3] for k in kernels.one_step_fwd.cache
+    ):
         kernels.one_step_fwd[grid](
             ifgo_ptr=torch.randn_like(ifgo),  # ifgo gets overwritten
             cell_ptr=cell,
@@ -271,9 +278,10 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
         )
         if TRACK_AUTOTUNE_RUNTIMES:
             for k, v in kernels.one_step_fwd.configs_timings.items():
-                CONFIG_RES[f"graph-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
+                CONFIG_RES[f"graph-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                    (str(k), v)
+                ]
     torch.cuda.nvtx.range_pop()
-
 
     torch.cuda.nvtx.range_push("graph capture")
     g = torch.cuda.CUDAGraph()
@@ -373,8 +381,10 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
     if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernel.cache):
         # triton.heuristics can't be used here
         # we need to modify the triton.Configs as a function of the inputs which isn't supported
-        CurrentShape = configs.PersistentData(BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size)
-        if (configs.ProblemShape != CurrentShape):
+        CurrentShape = configs.PersistentData(
+            BATCH_SIZE=batch_size, HIDDEN_SIZE=hidden_size
+        )
+        if configs.ProblemShape != CurrentShape:
             configs.ProblemShape = CurrentShape
             reload(kernels)  # reload the kernel with dynamically adjusted shapes etc.
             kernel = kernels.lstm_persistent_seq_bwd
@@ -391,12 +401,13 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
             batch_size=batch_size,
             hidden_size=hidden_size,
             seq_len=6,
-            dtype=dtype
-            )
+            dtype=dtype,
+        )
         if TRACK_AUTOTUNE_RUNTIMES:
             for k, v in kernel.configs_timings.items():
-                CONFIG_RES[f"persistentBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
-
+                CONFIG_RES[f"persistentBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                    (str(k), v)
+                ]
 
     kernel[Pgrid](
         d_out_ptr=dh,
@@ -514,7 +525,10 @@ def lstm_graph_bwd(
     grid = (
         triton.cdiv(hidden_size, BLOCK_SIZE_H) * triton.cdiv(batch_size, BLOCK_SIZE_B),
     )
-    grid = lambda META: (triton.cdiv(hidden_size, META["BLOCK_SIZE_H"]) * triton.cdiv(batch_size, META["BLOCK_SIZE_B"]), )
+    grid = lambda META: (
+        triton.cdiv(hidden_size, META["BLOCK_SIZE_H"])
+        * triton.cdiv(batch_size, META["BLOCK_SIZE_B"]),
+    )
 
     point_grid = (
         triton.cdiv(hidden_size, 32),
@@ -535,7 +549,9 @@ def lstm_graph_bwd(
                 hidden_size=hidden_size,
                 batch_size=batch_size,
                 seq_len=seq_len,
-                offset_ptr=offset if not warmup else torch.ones_like(offset),  # don't take first or last for tuning!
+                offset_ptr=offset
+                if not warmup
+                else torch.ones_like(offset),  # don't take first or last for tuning!
                 # BLOCK_SIZE_B=BLOCK_SIZE_B,
                 # BLOCK_SIZE_H=BLOCK_SIZE_H,
                 # BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -585,7 +601,9 @@ def lstm_graph_bwd(
     run(warmup=True)
     if TRACK_AUTOTUNE_RUNTIMES:
         for k, v in kernels.lstm_overlap_bwd.configs_timings.items():
-            CONFIG_RES[f"graphBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [(str(k), v)]
+            CONFIG_RES[f"graphBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                (str(k), v)
+            ]
 
     torch.cuda.nvtx.range_pop()
     if seq_len > 1:
@@ -762,7 +780,7 @@ class LSTMfn(torch.autograd.Function):
             fn = lstm_persistent_fwd
         elif batch_size < 8 or hidden_size > 1500:
             fn = lstm_graph_fwd
-        elif math.log2(batch_size)/6 + math.log2(hidden_size)/10 > 1.99:
+        elif math.log2(batch_size) / 6 + math.log2(hidden_size) / 10 > 1.99:
             fn = lstm_graph_fwd
         else:
             fn = lstm_persistent_fwd
@@ -784,10 +802,10 @@ class LSTMfn(torch.autograd.Function):
         #     fn = lstm_persistent_bwd
         # else:
         #     fn = lstm_graph_bwd
-        if dh.shape[-1] > 368 and  dh.shape[1] < 8:
+        if dh.shape[-1] > 368 and dh.shape[1] < 8:
             fn = lstm_graph_bwd
         else:
-            fn = lstm_persistent_bwd        
+            fn = lstm_persistent_bwd
 
         torch.cuda.nvtx.range_push("graph_bwd")
         x, out, cell, ifgo, Wx, Wh = ctx.saved_tensors
@@ -937,27 +955,35 @@ class FastLSTM(nn.Module):
 class FlashLSTM(nn.Module):
     def __init__(self, input_size, hidden_size, backend, dtype=None, device="cuda"):
         super().__init__()
-        self.gate_in = nn.Linear(input_size, 4 * hidden_size, dtype=dtype, device=device, bias=False)
+        self.gate_in = nn.Linear(
+            input_size, 4 * hidden_size, dtype=dtype, device=device, bias=False
+        )
         sqrt_k_inv = 1 / hidden_size**0.5
-        self.R = nn.Parameter(torch.randn([4, 1, hidden_size, hidden_size], device=device, dtype=dtype)* 2
-                    * sqrt_k_inv
-                    - sqrt_k_inv)
-        self.b = nn.Parameter(torch.randn([4, 1, hidden_size], device=device, dtype=dtype)* 2
-                    * sqrt_k_inv
-                    - sqrt_k_inv)
+        self.R = nn.Parameter(
+            torch.randn([4, 1, hidden_size, hidden_size], device=device, dtype=dtype)
+            * 2
+            * sqrt_k_inv
+            - sqrt_k_inv
+        )
+        self.b = nn.Parameter(
+            torch.randn([4, 1, hidden_size], device=device, dtype=dtype)
+            * 2
+            * sqrt_k_inv
+            - sqrt_k_inv
+        )
         self.hidden_size = hidden_size
         self.backend = backend
-        self.dtype = {torch.float16: "float16",
-                      torch.bfloat16: "bfloat16",
-                       torch.float32: "float32" }[dtype]
+        self.dtype = {
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }[dtype]
 
     def forward(self, x):
         R = self.R
         # convert to batch_first
-        Wx = self.gate_in(x.transpose(0,1))
-        Wx = Wx.reshape(
-                Wx.shape[0], Wx.shape[1], R.shape[0], R.shape[1], R.shape[2]
-            )
+        Wx = self.gate_in(x.transpose(0, 1))
+        Wx = Wx.reshape(Wx.shape[0], Wx.shape[1], R.shape[0], R.shape[1], R.shape[2])
 
         h_frnn, hlast_frnn = flashrnn(
             Wx=Wx,
@@ -967,9 +993,10 @@ class FlashLSTM(nn.Module):
             function="lstm",
             backend=self.backend,
             dtype=self.dtype,
-            )
+        )
 
         return h_frnn[0].transpose(0, 1).squeeze(-2), hlast_frnn
+
 
 #######################################################################################
 ################# versions below were experimental and aren't performant ##############

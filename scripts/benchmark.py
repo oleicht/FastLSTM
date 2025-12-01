@@ -22,7 +22,9 @@ def generate_configs():
     - hidden_size = [64 ... 2048]
     """
     configs = {}
-    for bs, hs, layer, seq_len in product(range(5, -1, -1), range(5, -1,-1), range(1), range(3, 4)):
+    for bs, hs, layer, seq_len in product(
+        range(5, -1, -1), range(0, -1, -1), range(1), range(3, 4)
+    ):
         name = f"s{64 << seq_len}_b{4 << bs}_h{64 << hs}_l{1 + layer}"
         configs[name] = (64 << seq_len, 4 << bs, 64 << hs, 1 + layer)
 
@@ -51,7 +53,7 @@ def run_benchmark(config, models, mode, dtype=None):
                 hidden_size=hidden_size,
                 device="cuda",
                 dtype=dtype,
-                backend=model.lower()
+                backend=model.lower(),
             )
         else:
             m = nn.LSTM(
@@ -126,8 +128,13 @@ def run_benchmark(config, models, mode, dtype=None):
 
         try:
             t = do_bench(fn, return_mode="median", warmup=int(warmup), rep=int(rep))
-        except (torch.OutOfMemoryError, torch.AcceleratorError,
-                CompilationError, OutOfResources, ValueError):
+        except (
+            torch.OutOfMemoryError,
+            torch.AcceleratorError,
+            CompilationError,
+            OutOfResources,
+            ValueError,
+        ):
             t = np.nan
         torch.cuda.synchronize()
         medians += [t]
@@ -135,7 +142,7 @@ def run_benchmark(config, models, mode, dtype=None):
 
 
 if __name__ == "__main__":
-    fname = "fp16"
+    fname = "small_fp16"
     overwrite = False
     dtype = [None, torch.bfloat16, torch.float16][2]
 
@@ -146,7 +153,7 @@ if __name__ == "__main__":
         if not overwrite and p.exists():
             raise ValueError(f"File {mode}_{fname} exists")
         models = [
-            "graph",
+            # "graph",
             "persistent",
         ]
 
@@ -160,7 +167,7 @@ if __name__ == "__main__":
         if mode != "bwd":
             models += [
                 "lstm",
-                "fast",
+                # "fast",
             ]
 
         bench = partial(run_benchmark, models=models, mode=mode, dtype=dtype)
