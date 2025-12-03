@@ -1,16 +1,6 @@
-from dataclasses import dataclass
-
 import torch
 import triton
 
-
-@dataclass
-class PersistentData:
-    BATCH_SIZE: int = 128
-    HIDDEN_SIZE: int = 128
-
-
-ProblemShape = PersistentData()
 
 SM_count = torch.cuda.get_device_properties("cuda").multi_processor_count
 
@@ -28,10 +18,10 @@ def get_graph_autotune_configs():
             num_stages=s,
         )
         for s in [4, 6, 8]
-        for w in [1, 2, 4]
+        for w in [4, 8]
         for k in [32, 64]
-        for h in [8, 16]
-        for b in [8, 16, 32, 64]
+        for h in [32, 64]
+        for b in [32, 64]
     ]
 
 
@@ -67,72 +57,89 @@ def compute_persistent_grid_dim(kwargs):
     return (num_pid_b * num_pid_h,)
 
 
-def get_persistent_autotune_configs(pfd: PersistentData, fully_fused=False):
+def prune_persistent_configs(configs, named_args, **kwargs):
     """
-    Be careful here! The setup relies on global state:
-    - HIDDEN_SIZE and BATCH_SIZE passed from lstm.py so that no deadlocks occur
-    """
-    # step 1:
-    # restrict to block_sizes_h that lead to non-deadlocked configs
-    hidden_block_sizes = []
-    for block_size in [8, 16, 32, 64, 128, 256]:
-        if triton.cdiv(pfd.HIDDEN_SIZE, block_size) > SM_count:
-            continue
-        elif block_size >= 2 * pfd.HIDDEN_SIZE:
-            continue
+    - select from a big grid of configs the relevant ones
+    - dynamically compute and overwrite some attributes
 
-        hidden_block_sizes += [block_size]
-    if fully_fused:
-        hidden_block_sizes = [triton.next_power_of_2(pfd.HIDDEN_SIZE)]
-    assert len(hidden_block_sizes) > 0, (
-        f"BLOCK_SIZE_H not large enough to support hidden_size {pfd.HIDDEN_SIZE} on {SM_count} many SMs."
+    ToDo:
+    - introduce logic to keep the number of tested configs small
+    """
+
+    hidden_size = kwargs["hidden_size"]
+    configs = [
+        c
+        for c in configs
+        if (
+            (triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_H"]) <= SM_count)
+            and (c.kwargs["BLOCK_SIZE_H"] < 2 * hidden_size)
+            and c.kwargs["BLOCK_SIZE_H"] in [32, 64, 128]
+        )
+    ]
+
+    if "RELOAD_WEIGHTS" in kwargs:
+        for c in configs:
+            k_steps = triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_K"])
+            c.kwargs["k_steps"] = k_steps
+        if not kwargs["RELOAD_WEIGHTS"]:
+            configs = [c for c in configs if c.kwargs["k_steps"] < 4]
+
+    if "W_x_ptr" in kwargs:
+        configs = [
+            c
+            for c in configs
+            if (
+                (c.kwargs["BLOCK_SIZE_K"] == triton.next_power_of_2(hidden_size))
+                and (c.kwargs["BLOCK_SIZE_H"] == triton.next_power_of_2(hidden_size))
+            )
+        ]
+
+        assert len(configs) > 0
+
+    configs = [c for c in configs if (c.kwargs["BLOCK_SIZE_B"] in [32])]
+
+    configs_new = []
+    for c in configs:
+        update_params = compute_batch_layout(
+            hidden_size,
+            c.kwargs["BLOCK_SIZE_H"],
+            kwargs["batch_size"],
+            c.kwargs["BLOCK_SIZE_B"],
+        )
+        c.kwargs["batch_chunks"] = update_params["batch_chunks"]
+        c.kwargs["num_pid_b"] = update_params["num_pid_b"]
+        configs_new += [c]
+    assert len(configs) < 25, (
+        f"Maybe worth trying to prune configs further! {len(configs)}"
     )
+    return configs_new
 
-    k_block_sizes = [32, 64]
-    if fully_fused:
-        k_block_sizes = [triton.next_power_of_2(pfd.HIDDEN_SIZE)]
 
-    batch_block_sizes = []
-    for block_size in [1, 8, 16, 32, 64, 128]:
-        if block_size >= 2 * pfd.BATCH_SIZE:
-            continue
-        if block_size == 1 and pfd.BATCH_SIZE >= 12:
-            continue
+def get_persistent_autotune_configs():
+    """
+    Define a huge grid of possibly interesting configs.
 
-        batch_block_sizes += [block_size]
-
+    prune_persistent_bwd_configs then selects the reasonable ones
+    and modified `num_pid_b` and `batch_chunks` accordingly
+    """
     configs = [
         triton.Config(
             {
                 "BLOCK_SIZE_K": k,
-            }
-            | compute_batch_layout(
-                hidden_size=pfd.HIDDEN_SIZE,
-                BLOCK_SIZE_H=h,
-                batch_size=pfd.BATCH_SIZE,
-                BLOCK_SIZE_B=b,
-            ),
+                "BLOCK_SIZE_H": h,
+                "BLOCK_SIZE_B": b,
+                "num_pid_b": 1,
+                "batch_chunks": 1,
+            },
             num_warps=w,
             num_stages=s,
         )
-        for k in k_block_sizes
-        for w in [1, 2, 4, 8]
-        for s in [1, 2, 4, 6]
-        for h in hidden_block_sizes
-        for b in batch_block_sizes
+        for k in [32, 64]
+        for w in [4, 8]
+        for s in [4, 6]
+        for h in [8, 16, 32, 64, 128, 256]
+        for b in [1, 8, 16, 32, 64, 128]
     ]
-
-    best_sm_ratio = max(
-        [
-            c.kwargs["num_pid_b"]
-            * (triton.cdiv(pfd.HIDDEN_SIZE, c.kwargs["BLOCK_SIZE_H"]))
-            / SM_count
-            for c in configs
-        ]
-    )
-    # remove configs that utilize too few SMs
-    # configs = [c for c in configs if c.kwargs["num_pid_b"] * (triton.cdiv(pfd.HIDDEN_SIZE, c.kwargs["BLOCK_SIZE_H"])) / SM_count > 0.75 * best_sm_ratio]
-    assert len(configs) > 0
     return configs
 
 

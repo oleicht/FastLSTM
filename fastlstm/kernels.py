@@ -405,8 +405,9 @@ def persistent_fwd_kernel_v2(
 
 
 @triton.autotune(
-    configs=configs.get_persistent_autotune_configs(configs.ProblemShape),
+    configs=configs.get_persistent_autotune_configs(),
     key=["batch_size", "hidden_size", "dtype"],
+    prune_configs_by={"early_config_prune": configs.prune_persistent_configs},
 )
 @triton.jit(do_not_specialize=["seq_len"])
 def persistent_fwd_kernel(
@@ -423,8 +424,8 @@ def persistent_fwd_kernel(
     BLOCK_SIZE_B: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
-    k_steps: tl.constexpr,
     dtype: tl.constexpr,
+    k_steps: tl.constexpr = 1,
     RELOAD_WEIGHTS: tl.constexpr = False,
 ):
     total_num_pid_b = tl.cdiv(batch_size, BLOCK_SIZE_B)
@@ -432,14 +433,7 @@ def persistent_fwd_kernel(
 
     # old
     pid = tl.program_id(axis=0)
-    # num_pid_in_group = GROUP_SIZE_B * num_pid_h
-    # group_id = pid // num_pid_in_group
-    # first_pid_b = group_id * GROUP_SIZE_B
-    # group_size_b = min(num_pid_b - first_pid_b, GROUP_SIZE_B)
-    # pid_b = first_pid_b + ((pid % num_pid_in_group) % group_size_b)
-    # pid_h = (pid % num_pid_in_group) // group_size_b
 
-    # pid = tl.atomic_add(pid_ptr, 1)
     pid_b = pid // num_pid_h
     pid_h = pid % num_pid_h
 
@@ -648,10 +642,9 @@ def persistent_fwd_kernel(
 
 
 @triton.autotune(
-    configs=configs.get_persistent_autotune_configs(
-        configs.ProblemShape, fully_fused=True
-    ),
+    configs=configs.get_persistent_autotune_configs(),
     key=["batch_size", "hidden_size", "dtype"],
+    prune_configs_by={"early_config_prune": configs.prune_persistent_configs},
 )
 @triton.jit(do_not_specialize=["seq_len"])
 def fully_fused_persistent_fwd_kernel(
@@ -674,6 +667,7 @@ def fully_fused_persistent_fwd_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     dtype: tl.constexpr,
+    fully_fused: tl.constexpr = True,
 ):
     tl.device_assert(tl.cdiv(hidden_size, BLOCK_SIZE_H) == 1)
     tl.device_assert(tl.cdiv(max(hidden_size, input_size), BLOCK_SIZE_K) == 1)
@@ -1177,8 +1171,9 @@ def lstm_h_grad(
 
 
 @triton.autotune(
-    configs=configs.get_persistent_autotune_configs(configs.ProblemShape),
+    configs=configs.get_persistent_autotune_configs(),
     key=["batch_size", "hidden_size", "dtype"],
+    prune_configs_by={"early_config_prune": configs.prune_persistent_configs},
 )
 @triton.jit(do_not_specialize=["seq_len"])
 def lstm_persistent_seq_bwd(
@@ -1232,15 +1227,14 @@ def lstm_persistent_seq_bwd(
     d_out_ptr += (seq_len - 1) * hidden_size * batch_size
 
     offsets_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)[None]
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
     for _ in range(batch_chunks):
         if pid_b < total_num_pid_b:
             s = sync_ptr + pid_b
 
             offsets_b = pid_b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)[:, None]
             c_mask = (offsets_b < batch_size) & (offsets_h < hidden_size)
-            ifgo_indices = offsets_h % hidden_size + 4 * hidden_size * offsets_b
-            c0_indices = offsets_h % hidden_size + hidden_size * offsets_b
+            ifgo_indices = offsets_h + 4 * hidden_size * offsets_b
+            c0_indices = offsets_h + hidden_size * offsets_b
 
             if LESS_IO:
                 dh = tl.load(d_h_ptr + c0_indices, mask=c_mask)
@@ -1251,7 +1245,7 @@ def lstm_persistent_seq_bwd(
                 if dtype != "fp32":
                     c1 = c1.cast(tl.float32)
                     dc1 = dc1.cast(tl.float32)
-            for _ in range(seq_len):
+            for _ in tl.range(seq_len, num_stages=1):
                 i = tl.load(ifgo_ptr + ifgo_indices, mask=c_mask)
                 f = tl.load(
                     ifgo_ptr + ifgo_indices + hidden_size,
@@ -1345,6 +1339,7 @@ def lstm_persistent_seq_bwd(
                 accumulator = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
                 K = 4 * hidden_size
                 N = hidden_size
+                offs_k = tl.arange(0, BLOCK_SIZE_K)
                 Wh_ptrs = Wh_ptr + (offs_k[:, None] * N + (offsets_h % hidden_size))
                 d_ifgo_ptrs = d_ifgo_ptr + (offsets_b * K + offs_k[None, :])
 
@@ -1508,6 +1503,8 @@ def lstm_overlap_bwd(
         target = tl.float16
     elif dtype == "bf16":
         target = tl.bfloat16
+    else:
+        target = tl.float32
 
     #######################################################################
     ################ compute dh_{n-1} using d_ifgo_n ######################
@@ -1536,7 +1533,6 @@ def lstm_overlap_bwd(
     tl.assume(BLOCK_SIZE_H > 0)
     tl.assume(GROUP_SIZE_B > 0)
     # tl.assume(seq_offset >= 0)
-    d_ifgo_ptr += seq_offset * batch_size * 4 * hidden_size
 
     K = 4 * hidden_size
     N = hidden_size
@@ -1544,24 +1540,23 @@ def lstm_overlap_bwd(
     offs_bn = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
     c_ptrs = dh_n_ptr + N * offs_am[:, None] + offs_bn[None, :]
     c_mask = (offs_am[:, None] < batch_size) & (offs_bn[None, :] < N)
-
+    d_ifgo_ptr += seq_offset * batch_size * 4 * hidden_size
     if seq_offset < seq_len:
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         a_ptrs = d_ifgo_ptr + (offs_am[:, None] * K + offs_k[None, :])
         b_ptrs = Wh_ptr + (offs_k[:, None] * N + offs_bn[None, :])
 
-        accumulator = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        dh_n = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_H), dtype=tl.float32)
+        for k in tl.range(tl.cdiv(K, BLOCK_SIZE_K)):
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
             if dtype != "fp32":
                 b = b.cast(target)
 
-            accumulator = tl.dot(a, b, accumulator)
+            dh_n = tl.dot(a, b, dh_n)
             a_ptrs += BLOCK_SIZE_K
             b_ptrs += BLOCK_SIZE_K * N
 
-        dh_n = accumulator
         if dtype != "fp32":
             dh_n = dh_n.cast(target)
         tl.store(c_ptrs, dh_n, mask=c_mask)
@@ -1595,11 +1590,10 @@ def lstm_overlap_bwd(
 
         c0 = tl.load(c0_ptr + c0_indices, mask=c_mask)
         c1 = tl.load(c0_ptr + hidden_size * batch_size + c0_indices, mask=c_mask)
-
-        dh = dh_n + tl.load(
+        dc1 = tl.load(d_c_ptr + c0_indices, mask=c_mask)
+        dh = tl.load(
             d_out_ptr + seq_offset * hidden_size * batch_size + c0_indices, mask=c_mask
         )
-        dc1 = tl.load(d_c_ptr + c0_indices, mask=c_mask)
 
         if dtype != "fp32":
             i = i.cast(tl.float32)
@@ -1610,6 +1604,7 @@ def lstm_overlap_bwd(
             c1 = c1.cast(tl.float32)
             dc1 = dc1.cast(tl.float32)
 
+        dh += dh_n
         dc1 += dh * tl.sigmoid(o) * (1.0 - libdevice.tanh(c1) * libdevice.tanh(c1))
 
         d_o = dh * libdevice.tanh(c1) * tl.sigmoid(o) * (1 - tl.sigmoid(o))
@@ -1620,7 +1615,7 @@ def lstm_overlap_bwd(
         d_i = dc1 * libdevice.tanh(g) * tl.sigmoid(i) * (1.0 - tl.sigmoid(i))
         d_g = dc1 * tl.sigmoid(i) * (1.0 - libdevice.tanh(g) * libdevice.tanh(g))
 
-        d_ifgo_ptr -= batch_size * K
+        d_ifgo_ptr -= batch_size * 4 * hidden_size
         if dtype != "fp32":
             tl.store(d_ifgo_ptr + ifgo_indices, d_i.cast(target), mask=c_mask)
             tl.store(
