@@ -44,6 +44,8 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
             version = 3
         else:
             version = 1
+
+    print(f"Version: {version}")
     assert x.is_contiguous()
     assert Wh.is_contiguous()
     torch.cuda.nvtx.range_pop()
@@ -64,10 +66,13 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
         ifgo = torch.addmm(
             bx + bh, x.view(seq_len * batch_size, -1), Wx.T, beta=1.0, alpha=1.0
         ).view(seq_len, batch_size, -1)
-        extra_args = {}
+        if version == 1:
+            extra_args = {
+                "RELOAD_WEIGHTS": False  #  hidden_size > 128 / (1 + dtype.endswith("16"))
+            }
 
-    if version == 1 and hidden_size > 128 / (1 + dtype.endswith("16")):
-        extra_args.update({"RELOAD_WEIGHTS": True})
+        else:
+            extra_args = {}
 
     assert ifgo.stride(1) == 4 * hidden_size
     assert ifgo.stride(2) == 1

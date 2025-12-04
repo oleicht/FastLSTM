@@ -3,6 +3,7 @@ import triton
 
 
 SM_count = torch.cuda.get_device_properties("cuda").multi_processor_count
+shared_memory = torch.cuda.get_device_properties("cuda").shared_memory_per_block
 
 
 def get_graph_autotune_configs():
@@ -57,6 +58,10 @@ def compute_persistent_grid_dim(kwargs):
     return (num_pid_b * num_pid_h,)
 
 
+def naive_rmem_estimation(n_bytes, K, M, N, num_stages):
+    return num_stages * n_bytes * (K * M + K * N + N * M) / shared_memory
+
+
 def prune_persistent_configs(configs, named_args, **kwargs):
     """
     - select from a big grid of configs the relevant ones
@@ -64,42 +69,72 @@ def prune_persistent_configs(configs, named_args, **kwargs):
 
     ToDo:
     - introduce logic to keep the number of tested configs small
+    - this logic needs to account for the dtype!
     """
 
     hidden_size = kwargs["hidden_size"]
+    batch_size = kwargs["batch_size"]
+
     configs = [
         c
         for c in configs
         if (
-            (triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_H"]) <= SM_count)
-            and (c.kwargs["BLOCK_SIZE_H"] < 2 * hidden_size)
-            and c.kwargs["BLOCK_SIZE_H"] in [32, 64, 128]
+            (
+                triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_H"]) <= SM_count
+            )  # prevent deadlocks
+            and (
+                (c.kwargs["BLOCK_SIZE_H"] < 2 * hidden_size) or (hidden_size < 16)
+            )  # these configs do unnecessary computations
         )
     ]
 
+    # standard persistent kernel
     if "RELOAD_WEIGHTS" in kwargs:
         for c in configs:
-            k_steps = triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_K"])
-            c.kwargs["k_steps"] = k_steps
-        if not kwargs["RELOAD_WEIGHTS"]:
-            configs = [c for c in configs if c.kwargs["k_steps"] < 4]
+            c.kwargs["k_steps"] = triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_K"])
 
-    if "W_x_ptr" in kwargs:
+        # RELOAD means weights are reloaded every time-step
+        # this reduces shared memory pressues and relies on cache instead
+        if not kwargs["RELOAD_WEIGHTS"]:
+            # kernel only implements up to 4 weight chunks
+            configs = [c for c in configs if c.kwargs["k_steps"] <= 4]
+
+    # fully fused persistent -- ie Wx is part of it!
+    elif "W_x_ptr" in kwargs:
         configs = [
             c
             for c in configs
             if (
-                (c.kwargs["BLOCK_SIZE_K"] == triton.next_power_of_2(hidden_size))
-                and (c.kwargs["BLOCK_SIZE_H"] == triton.next_power_of_2(hidden_size))
+                c.kwargs["BLOCK_SIZE_K"] == c.kwargs["BLOCK_SIZE_H"]
+                and (
+                    c.kwargs["BLOCK_SIZE_H"]
+                    >= triton.next_power_of_2(max(hidden_size, kwargs["input_size"]))
+                )
             )
         ]
 
         assert len(configs) > 0
+    else:
+        # that's the bwd pass
+        pass
 
-    configs = [c for c in configs if (c.kwargs["BLOCK_SIZE_B"] in [32])]
-
+    # filter batch-size related things
     configs_new = []
     for c in configs:
+        if not ((c.kwargs["BLOCK_SIZE_B"] < 2 * batch_size) or (batch_size < 8)):
+            continue
+
+        rmem = naive_rmem_estimation(
+            n_bytes=2 if kwargs["dtype"].endswith("16") else 4,
+            K=c.kwargs["BLOCK_SIZE_K"],
+            M=4 * c.kwargs["BLOCK_SIZE_H"],
+            N=c.kwargs["BLOCK_SIZE_B"],
+            num_stages=c.all_kwargs()["num_stages"],
+        )
+
+        if rmem > 1.0 or rmem < 0.7:
+            continue
+
         update_params = compute_batch_layout(
             hidden_size,
             c.kwargs["BLOCK_SIZE_H"],
@@ -109,8 +144,9 @@ def prune_persistent_configs(configs, named_args, **kwargs):
         c.kwargs["batch_chunks"] = update_params["batch_chunks"]
         c.kwargs["num_pid_b"] = update_params["num_pid_b"]
         configs_new += [c]
-    assert len(configs) < 25, (
-        f"Maybe worth trying to prune configs further! {len(configs)}"
+
+    assert len(configs_new) < 40, (
+        f"Maybe worth trying to prune configs further! {len(configs_new)}"
     )
     return configs_new
 

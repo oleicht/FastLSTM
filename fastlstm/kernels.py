@@ -480,7 +480,7 @@ def persistent_fwd_kernel(
         W_h_ptrs = W_h_ptr + (offs_k[:, None] * 1 + offs_bh[None, :] * hidden_size)
 
         if not RELOAD_WEIGHTS:
-            tl.assume(k_steps < 4)
+            tl.assume(k_steps <= 4)
             w_mask = offs_k[:, None] < hidden_size
             W_i0 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
             W_f0 = tl.load(
@@ -587,18 +587,19 @@ def persistent_fwd_kernel(
                     mask=offs_k[None, :] < hidden_size,
                     other=0.0,
                 )
-                W_h_ptrs += BLOCK_SIZE_K
+                h_mm_ptrs += BLOCK_SIZE_K
                 i = tl.dot(h_0, W_i0, i)
                 f = tl.dot(h_0, W_f0, f)
                 g = tl.dot(h_0, W_g0, g)
                 o = tl.dot(h_0, W_o0, o)
+
                 if k_steps > 1:
                     h_0 = tl.load(
                         h_mm_ptrs,
                         mask=offs_k[None, :] < hidden_size - BLOCK_SIZE_K,
                         other=0.0,
                     )
-                    W_h_ptrs += BLOCK_SIZE_K
+                    h_mm_ptrs += BLOCK_SIZE_K
                     i = tl.dot(h_0, W_i1, i)
                     f = tl.dot(h_0, W_f1, f)
                     g = tl.dot(h_0, W_g1, g)
@@ -609,7 +610,7 @@ def persistent_fwd_kernel(
                         mask=offs_k[None, :] < hidden_size - 2 * BLOCK_SIZE_K,
                         other=0.0,
                     )
-                    W_h_ptrs += BLOCK_SIZE_K
+                    h_mm_ptrs += BLOCK_SIZE_K
                     i = tl.dot(h_0, W_i2, i)
                     f = tl.dot(h_0, W_f2, f)
                     g = tl.dot(h_0, W_g2, g)
@@ -620,7 +621,7 @@ def persistent_fwd_kernel(
                         mask=offs_k[None, :] < hidden_size - 3 * BLOCK_SIZE_K,
                         other=0.0,
                     )
-                    W_h_ptrs += BLOCK_SIZE_K
+                    h_mm_ptrs += BLOCK_SIZE_K
                     i = tl.dot(h_0, W_i3, i)
                     f = tl.dot(h_0, W_f3, f)
                     g = tl.dot(h_0, W_g3, g)
@@ -657,7 +658,6 @@ def persistent_fwd_kernel(
                 tl.store(h_write_ptrs, h, mask=mask)
 
             # synchronize within block -> h vector is updated
-            tl.debug_barrier()
             # update global counter
             global_sync_ptrl += total_num_pid_b
             tl.atomic_add(global_sync_ptrl, 1, sem="release")
