@@ -483,31 +483,55 @@ def persistent_fwd_kernel(
             tl.assume(k_steps < 4)
             w_mask = offs_k[:, None] < hidden_size
             W_i0 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
-            W_f0 = tl.load(W_h_ptrs + 1 * hidden_size, mask=w_mask, other=0.0)
-            W_g0 = tl.load(W_h_ptrs + 2 * hidden_size, mask=w_mask, other=0.0)
-            W_o0 = tl.load(W_h_ptrs + 4 * hidden_size, mask=w_mask, other=0.0)
+            W_f0 = tl.load(
+                W_h_ptrs + 1 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+            W_g0 = tl.load(
+                W_h_ptrs + 2 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+            W_o0 = tl.load(
+                W_h_ptrs + 3 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
             W_h_ptrs += BLOCK_SIZE_K
 
         if not RELOAD_WEIGHTS and k_steps > 1:
             w_mask = offs_k[:, None] < hidden_size - BLOCK_SIZE_K
             W_i1 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
-            W_f1 = tl.load(W_h_ptrs + 1 * hidden_size, mask=w_mask, other=0.0)
-            W_g1 = tl.load(W_h_ptrs + 2 * hidden_size, mask=w_mask, other=0.0)
-            W_o1 = tl.load(W_h_ptrs + 4 * hidden_size, mask=w_mask, other=0.0)
+            W_f1 = tl.load(
+                W_h_ptrs + 1 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+            W_g1 = tl.load(
+                W_h_ptrs + 2 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+            W_o1 = tl.load(
+                W_h_ptrs + 3 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
             W_h_ptrs += BLOCK_SIZE_K
         if not RELOAD_WEIGHTS and k_steps > 2:
             w_mask = offs_k[:, None] < hidden_size - 2 * BLOCK_SIZE_K
             W_i2 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
-            W_f2 = tl.load(W_h_ptrs + 1 * hidden_size, mask=w_mask, other=0.0)
-            W_g2 = tl.load(W_h_ptrs + 2 * hidden_size, mask=w_mask, other=0.0)
-            W_o2 = tl.load(W_h_ptrs + 4 * hidden_size, mask=w_mask, other=0.0)
+            W_f2 = tl.load(
+                W_h_ptrs + 1 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+            W_g2 = tl.load(
+                W_h_ptrs + 2 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+            W_o2 = tl.load(
+                W_h_ptrs + 3 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
             W_h_ptrs += BLOCK_SIZE_K
         if not RELOAD_WEIGHTS and k_steps > 3:
             w_mask = offs_k[:, None] < hidden_size - 3 * BLOCK_SIZE_K
             W_i3 = tl.load(W_h_ptrs, mask=w_mask, other=0.0)
-            W_f3 = tl.load(W_h_ptrs + 1 * hidden_size, mask=w_mask, other=0.0)
-            W_g3 = tl.load(W_h_ptrs + 2 * hidden_size, mask=w_mask, other=0.0)
-            W_o3 = tl.load(W_h_ptrs + 4 * hidden_size, mask=w_mask, other=0.0)
+            W_f3 = tl.load(
+                W_h_ptrs + 1 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+            W_g3 = tl.load(
+                W_h_ptrs + 2 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
+            W_o3 = tl.load(
+                W_h_ptrs + 3 * hidden_size * hidden_size, mask=w_mask, other=0.0
+            )
             W_h_ptrs += BLOCK_SIZE_K
 
         for ss in range(seq_len):

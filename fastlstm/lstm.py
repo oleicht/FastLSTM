@@ -27,7 +27,7 @@ dtype_str = {
 }
 
 
-def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1):
+def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=None):
     torch.cuda.nvtx.range_push("fwd setup")
     if x.dim() == 2:
         x = x[None]
@@ -35,12 +35,12 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=1
     dtype = dtype_str[x.dtype]
     seq_len, batch_size, input_size = x.shape
     hidden_size = Wh.shape[1]
-
+    size = max(hidden_size, input_size)
     if version is None:
         # should be more general: the idea here is finding out whether W @ x is memory bound too
         # fp32 -> use fully fused <= 64
         # half prec; use <= 128
-        if hidden_size <= (1 + dtype.endswith("16")) * 32:
+        if size <= (1 + dtype.endswith("16")) * 32:
             version = 3
         else:
             version = 1

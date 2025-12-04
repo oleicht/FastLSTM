@@ -135,8 +135,8 @@ def get_persistent_autotune_configs():
             num_stages=s,
         )
         for k in [32, 64]
-        for w in [4, 8]
-        for s in [4, 6]
+        for w in [1, 4, 8]
+        for s in [1, 4, 6]
         for h in [8, 16, 32, 64, 128, 256]
         for b in [1, 8, 16, 32, 64, 128]
     ]
