@@ -74,6 +74,7 @@ def prune_persistent_configs(configs, named_args, **kwargs):
 
     hidden_size = kwargs["hidden_size"]
     batch_size = kwargs["batch_size"]
+    fully_fused_pers = "W_x_ptr" in kwargs
 
     configs = [
         c
@@ -83,11 +84,13 @@ def prune_persistent_configs(configs, named_args, **kwargs):
                 triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_H"]) <= SM_count
             )  # prevent deadlocks
             and (
-                (c.kwargs["BLOCK_SIZE_H"] < 2 * hidden_size) or (hidden_size < 16)
+                (c.kwargs["BLOCK_SIZE_H"] < 2 * hidden_size)
+                or (hidden_size < 16)
+                or fully_fused_pers
             )  # these configs do unnecessary computations
         )
     ]
-
+    assert len(configs) > 0, "Problem with block_size_h filter"
     # standard persistent kernel
     if "RELOAD_WEIGHTS" in kwargs:
         for c in configs:
@@ -100,7 +103,7 @@ def prune_persistent_configs(configs, named_args, **kwargs):
             configs = [c for c in configs if c.kwargs["k_steps"] <= 4]
 
     # fully fused persistent -- ie Wx is part of it!
-    elif "W_x_ptr" in kwargs:
+    elif fully_fused_pers:
         configs = [
             c
             for c in configs
@@ -132,7 +135,7 @@ def prune_persistent_configs(configs, named_args, **kwargs):
             num_stages=c.all_kwargs()["num_stages"],
         )
 
-        if rmem > 1.0 or rmem < 0.7:
+        if rmem > 1.4 or rmem < 1.1:
             continue
 
         update_params = compute_batch_layout(
