@@ -45,7 +45,6 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
         else:
             version = 1
 
-    print(f"Version: {version}")
     assert x.is_contiguous()
     assert Wh.is_contiguous()
     torch.cuda.nvtx.range_pop()
@@ -68,7 +67,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
         ).view(seq_len, batch_size, -1)
         if version == 1:
             extra_args = {
-                "RELOAD_WEIGHTS": False  #  hidden_size > 128 / (1 + dtype.endswith("16"))
+                "RELOAD_WEIGHTS": hidden_size > 128 / (1 + dtype.endswith("16"))
             }
 
         else:
@@ -146,7 +145,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
             cell_ptr=cell,
             h_ptr=out,
             W_h_ptr=Wh,
-            seq_len=6,
+            seq_len=min(6, seq_len),
             batch_size=batch_size,
             hidden_size=hidden_size,
             global_sync_ptr=torch.zeros_like(global_sync),
@@ -384,7 +383,7 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
             sync_ptr=torch.zeros_like(sync),
             batch_size=batch_size,
             hidden_size=hidden_size,
-            seq_len=6,
+            seq_len=min(seq_len, 6),
             dtype=dtype,
         )
         if TRACK_AUTOTUNE_RUNTIMES:
