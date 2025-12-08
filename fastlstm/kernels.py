@@ -655,8 +655,7 @@ def persistent_fwd_kernel(
                 tl.store(cell_ptrs, c, mask=mask)
                 tl.store(h_write_ptrs, h, mask=mask)
 
-            # synchronize within block -> h vector is updated
-            # update global counter
+            tl.debug_barrier()  # this is key!
             global_sync_ptrl += total_num_pid_b
             tl.atomic_add(global_sync_ptrl, 1, sem="release")
 
@@ -1352,6 +1351,7 @@ def lstm_persistent_seq_bwd(
                     if not LESS_IO:
                         tl.store(d_c_ptr + c0_indices, dc0, mask=c_mask)
 
+                tl.debug_barrier()
                 tl.atomic_add(s, 1, sem="release")
                 # before the channel mixing, make sure all channels are ready
                 while tl.atomic_add(s, 0, sem="acquire") < num_pid_h:
