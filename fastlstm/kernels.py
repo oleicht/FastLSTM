@@ -12,6 +12,7 @@ from fastlstm import configs
 #######################################################################################
 @triton.autotune(
     configs=configs.get_graph_autotune_configs(),
+    prune_configs_by={"early_config_prune": configs.prune_graph_configs},
     key=["batch_size", "hidden_size", "dtype"],
 )
 @triton.jit

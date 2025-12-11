@@ -67,7 +67,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
         ).view(seq_len, batch_size, -1)
         if version == 1:
             extra_args = {
-                "RELOAD_WEIGHTS": hidden_size > 128 / (1 + dtype.endswith("16"))
+                "RELOAD_WEIGHTS": hidden_size > 64 * (1 + dtype.endswith("16"))
             }
 
         else:

@@ -18,11 +18,11 @@ def get_graph_autotune_configs():
             num_warps=w,
             num_stages=s,
         )
-        for s in [4, 6, 8]
-        for w in [4, 8]
+        for s in [1, 2, 3, 4, 5, 6, 7, 8]
+        for w in [1, 2, 4, 8]
         for k in [32, 64]
-        for h in [32, 64]
-        for b in [32, 64]
+        for h in [16, 32, 64, 128, 256]
+        for b in [16, 32, 64, 128]
     ]
 
 
@@ -63,14 +63,81 @@ def naive_smem_estimation(n_bytes, K, M, N, num_stages):
     return num_stages * n_bytes * (K * M + K * N) / shared_memory
 
 
+def prune_graph_configs(configs, named_args, **kwargs):
+    hidden_size = kwargs["hidden_size"]
+    batch_size = kwargs["batch_size"]
+
+    configs = [
+        c
+        for c in configs
+        if (
+            (c.kwargs["BLOCK_SIZE_H"] < 2 * hidden_size)
+            or (hidden_size < 16 and c.kwargs["BLOCK_SIZE_H"] < 32)
+        )
+    ]
+    configs_new = []
+    for c in configs:
+        if not (
+            (c.kwargs["BLOCK_SIZE_B"] < 2 * batch_size)
+            or (batch_size < 8 and c.kwargs["BLOCK_SIZE_B"] < 32)
+        ):
+            continue
+
+        rmem = naive_smem_estimation(
+            n_bytes=2 if kwargs["dtype"].endswith("16") else 4,
+            K=c.kwargs["BLOCK_SIZE_K"],
+            M=4 * c.kwargs["BLOCK_SIZE_H"],
+            N=c.kwargs["BLOCK_SIZE_B"],
+            num_stages=c.all_kwargs()["num_stages"],
+        )
+
+        if rmem > 3:
+            continue
+
+        tile_size = 4 * c.kwargs["BLOCK_SIZE_H"] * c.kwargs["BLOCK_SIZE_B"]
+
+        if tile_size <= 256:
+            target_num_warps = [1]
+            target_num_stages = [4, 5, 6]
+        elif tile_size <= 1024:
+            target_num_warps = [2]
+            target_num_stages = [4, 5]
+        elif tile_size <= 2048:
+            target_num_warps = [4]
+            target_num_stages = [2, 3, 4]
+        elif tile_size <= 4096:
+            target_num_warps = [4, 8]
+            target_num_stages = [3, 4]
+        else:
+            target_num_warps = [8]
+            target_num_stages = [1, 2, 3]
+
+        if c.all_kwargs()["num_warps"] not in target_num_warps:
+            continue
+
+        if c.all_kwargs()["num_stages"] not in target_num_stages:
+            continue
+
+        configs_new += [c]
+
+    def _mm_intensity(c):
+        M = 4 * c.kwargs["BLOCK_SIZE_H"]
+        N = c.kwargs["BLOCK_SIZE_B"]
+        K = (
+            c.kwargs.get("k_steps", triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_K"]))
+            * c.kwargs["BLOCK_SIZE_K"]
+        )
+        return M * N * K / (M * N + K * M + K * N)
+
+    max_intensity = max(_mm_intensity(c) for c in configs_new)
+    configs_new = [c for c in configs_new if _mm_intensity(c) > max_intensity / 4]
+    return configs_new
+
+
 def prune_persistent_configs(configs, named_args, **kwargs):
     """
     - select from a big grid of configs the relevant ones
     - dynamically compute and overwrite some attributes
-
-    ToDo:
-    - introduce logic to keep the number of tested configs small
-    - this logic needs to account for the dtype!
     """
 
     hidden_size = kwargs["hidden_size"]
