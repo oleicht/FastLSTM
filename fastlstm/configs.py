@@ -139,7 +139,7 @@ def prune_graph_configs(configs, named_args, **kwargs):
         return M * N * K / (M * N + K * M + K * N)
 
     max_intensity = max(_mm_intensity(c) for c in configs_new)
-    configs_new = [c for c in configs_new if _mm_intensity(c) > max_intensity / 4]
+    configs_new = [c for c in configs_new if _mm_intensity(c) >= max_intensity / 4]
     return configs_new
 
 
@@ -272,7 +272,7 @@ def prune_persistent_configs(configs, named_args, **kwargs):
         return M * N * K / (M * N + K * M + K * N)
 
     max_intensity = max(_mm_intensity(c) for c in configs_new)
-    configs_new = [c for c in configs_new if _mm_intensity(c) > max_intensity / 4]
+    configs_new = [c for c in configs_new if _mm_intensity(c) >= max_intensity / 4]
     return configs_new
 
 

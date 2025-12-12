@@ -1,31 +1,26 @@
 ## FastLSTM
-Why implement an LSTM in 2025? Mostly as an exercise to improve my gpu programming and algorithmic reasoning skills given the non-trivial dependency structure within an LSTM. There also wasn't, to the best of my knowledge, a fast open source LSTM implementation.
+Why implement an LSTM in 2025? Mostly as an exercise to improve my gpu programming and algorithmic reasoning skills given the non-trivial dependency structure within an LSTM.
 
 This repo attempts to provide an reasonably performant LSTM implementation using pytorch and triton. The next section contains a speed comparison with `nn.LSTM`. Next, we go into the implementation details beginning with the relevant equations, followed by comments about the high-level design choices.
 
 ### Benchmarking
-The tables below compare median runtimes, computed with `triton.testing.do_bench` on an RTX 2000 Ada gpu, between `FastRNN` and `nn.LSTM` in single precision.
+The tables below compare median runtimes, computed with `triton.testing.do_bench` on a H100 SXM gpu in fp16. The first two column blocks are relative runtime compared to `nn.LSTM` with the first block (`fast/lstm`) being the implementation in this repo and the second one from [FlashRNN](#related-work). 
 
 More figures and the raw data can be found in `./figures`.
 
 ### FWD
-<img src="./figures/fwd_fp32.png" width="800">
+<img src="./figures/fwd_h100_fp16.png" width="800">
 
 ### FWD+BWD
-<img src="./figures/fwd+bwd_fp32.png" width="800">
+<img src="./figures/fwd_bwd_h100_fp16.png" width="800">
 
-### Caveat
-The numbers here are not perfectly correlated with the iterations/second produced in `scripts/overfit.py`.
+### Comments
 
-### Half precision
-When re-running the benchmark without re-tuning the kernels and the graph/persistent kernel boundary I find:
-
-- In the forward pass, there are up to 30\% gains when using bf16 or fp16 in FastLSTM
-- Combining forward and backward pass, the gains are order 40\%
+- The numbers here are not perfectly correlated with the iterations/second produced in `scripts/overfit.py`.
 - `nn.LSTM` in full bfloat16 seems broken: it runs in most configurations a few times slower than the single precision version. fp16 version runs as expected. Using `torch.autocast` alleviates the issue
-- `nn.LSTM` gains slightly more from fp16 than `FastLSTM` but that might be down to the lack of re-tuning
 
-I have not investigated lower precision such as fp8 or even lower dtypes.
+
+I have not investigated lower precision such as fp8.
 
 
 ### The maths
@@ -90,14 +85,13 @@ To compute $d c_t$ and $d h_t$ there are again two types of kernels available: o
 - use atomics to implement cross-program synchronization (but be careful with deadlocks)
 
 ### Limitations
-- only tuned for RTX 2000 Ada
+- tuning done for recent hardware such RTX {2000, 400} Ada and H100
 - `nn.LSTM` has extra options `bias`, `batch_first`, `dropout`, `bidirectional`, `proj_size` that `FastLSTM` doesn't support yet
 - can't operate on `PackedSequence` input
-- accuracy of half-precision might be suboptimal: I did not think carefully about whether some components need to remain in single precision
 - doesn't exploit `num_layer` parallelisation dimension (which `nn.LSTM` does!)
 - not battletested
 
 ### Related work
-[FlashRNN](https://arxiv.org/abs/2412.07752) offers, among other things, a fast LSTM implementation in their [repo](https://github.com/NX-AI/flashrnn). However, as this reproduction of fig. 4 from the paper shows, it is possible to implement LSTMs more efficiently, even in triton.
+[FlashRNN](https://arxiv.org/abs/2412.07752) offers, among other things, a various LSTM implementations in CUDA in their [repo](https://github.com/NX-AI/flashrnn). However, as this reproduction of fig. 4 from the paper shows, it is possible to implement LSTMs more efficiently, even in triton.
 
 <img src="./figures/flashrnn_fig4.png" width="800">
