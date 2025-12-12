@@ -98,4 +98,6 @@ To compute $d c_t$ and $d h_t$ there are again two types of kernels available: o
 - not battletested
 
 ### Related work
-[FlashRNN](https://arxiv.org/abs/2412.07752) attempts to implement, among other things, a fast LSTM implementation in their [repo](https://github.com/NX-AI/flashrnn). However, as their figure 2 demonstrates: the implemenation is much slower than `nn.LSTM` and only when introducing lots of sparsity can they match the runtime. Eg. For a batch-size 16, seq-len 1024, hidden-size 768 and running on an H100, the parameter count needs to be reduced by a factor 24 to match `nn.LSTM`'s runtime.
+[FlashRNN](https://arxiv.org/abs/2412.07752) offers, among other things, a fast LSTM implementation in their [repo](https://github.com/NX-AI/flashrnn). However, as this reproduction of fig. 4 from the paper shows, it is possible to implement LSTMs more efficiently, even in triton.
+
+<img src="./figures/flashrnn_fig4.png" width="800">

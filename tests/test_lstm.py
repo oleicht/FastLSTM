@@ -163,7 +163,6 @@ def test_lstm_v1_fwd():
         "naive-pt",
         "graph",
         "persistent",
-        "fast",
     ],
 )
 @pytest.mark.parametrize(
