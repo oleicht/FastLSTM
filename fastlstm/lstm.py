@@ -744,78 +744,6 @@ class GraphLSTMfn(torch.autograd.Function):
         return d_x, dh_0, dc_0, dWx, dbx, dWh, dbh
 
 
-class LSTMfn(torch.autograd.Function):
-    FWD_TRITON_CONFIG = None
-    BWD_TRITON_CONFIG = None
-
-    @staticmethod
-    def forward(ctx, x, h_0, c_0, Wx, bx, Wh, bh):
-        # select kernel
-        _, batch_size, hidden_size = x.shape
-        fn = lstm_graph_fwd
-        # was for fp32
-        # if hidden_size >= 1024:
-        #     fn = lstm_graph_fwd
-        # elif (batch_size < 64) or (hidden_size <= 64):
-        #     fn = lstm_persistent_fwd
-        # elif (hidden_size / 64) + (batch_size / 64) < 3.5:
-        #     fn = lstm_persistent_fwd
-        if hidden_size < 512:
-            fn = lstm_persistent_fwd
-        elif batch_size < 8 or hidden_size > 1500:
-            fn = lstm_graph_fwd
-        elif math.log2(batch_size) / 6 + math.log2(hidden_size) / 10 > 1.99:
-            fn = lstm_graph_fwd
-        else:
-            fn = lstm_persistent_fwd
-
-        torch.cuda.nvtx.range_push("graph_fwd")
-        out, cell, ifgo = fn(
-            x, h_0, c_0, Wx, bx, Wh, bh, triton_config=LSTMfn.FWD_TRITON_CONFIG
-        )
-        ctx.save_for_backward(x, out, cell, ifgo, Wx, Wh)
-        ctx.h0_is_nan = h_0 is None
-        out = out[1:]  # first one is initial condition
-        torch.cuda.nvtx.range_pop()
-        return out, (out[-1], cell[-1])
-
-    @staticmethod
-    def backward(ctx, dh, d_out_cell):
-        # select kernel
-        # if dh.shape[-1] < 1500:
-        #     fn = lstm_persistent_bwd
-        # else:
-        #     fn = lstm_graph_bwd
-        if dh.shape[-1] > 368 and dh.shape[1] < 8:
-            fn = lstm_graph_bwd
-        else:
-            fn = lstm_persistent_bwd
-
-        torch.cuda.nvtx.range_push("graph_bwd")
-        x, out, cell, ifgo, Wx, Wh = ctx.saved_tensors
-        if d_out_cell is None:
-            dc_n, dh_n = torch.zeros_like(cell[:2]).unbind(0)
-        else:
-            raise ValueError("Not implemented")
-        d_x, dh_0, dc_0, dWx, dbx, dWh, dbh = fn(
-            dh,
-            dc_n,
-            dh_n,
-            x,
-            out,
-            cell,
-            ifgo,
-            Wx,
-            Wh,
-            triton_config=LSTMfn.BWD_TRITON_CONFIG,
-        )
-        if ctx.h0_is_nan:
-            dh_0 = None
-            dc_0 = None
-        torch.cuda.nvtx.range_pop()
-        return d_x, dh_0, dc_0, dWx, dbx, dWh, dbh
-
-
 #######################################################################################
 ################################ nn.Module wrapper ####################################
 #######################################################################################
@@ -825,7 +753,7 @@ class FastLSTM(nn.Module):
         input_size,
         hidden_size,
         num_layers=1,
-        version="fast",
+        version="persistent",
         device=None,
         dtype=None,
     ):
@@ -907,14 +835,12 @@ class FastLSTM(nn.Module):
         c_n = []
 
         match self.version:
-            case "naive-pt":
-                fn = NaiveLSTMfn.apply
             case "persistent":
                 fn = PersistentLSTMfn.apply
             case "graph":
                 fn = GraphLSTMfn.apply
-            case "fast":
-                fn = LSTMfn.apply
+            case "naive-pt":
+                fn = NaiveLSTMfn.apply
             case "v1":
                 fn = V1LSTMfn.apply
             case _:

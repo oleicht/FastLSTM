@@ -64,6 +64,15 @@ def naive_smem_estimation(n_bytes, K, M, N, num_stages):
 
 
 def prune_graph_configs(configs, named_args, **kwargs):
+    bwd = "d_out_ptr" in kwargs
+
+    if bwd:
+        k_infl = 4
+        h_infl = 1
+    else:
+        k_infl = 1
+        h_infl = 4
+
     hidden_size = kwargs["hidden_size"]
     batch_size = kwargs["batch_size"]
 
@@ -85,8 +94,8 @@ def prune_graph_configs(configs, named_args, **kwargs):
 
         rmem = naive_smem_estimation(
             n_bytes=2 if kwargs["dtype"].endswith("16") else 4,
-            K=c.kwargs["BLOCK_SIZE_K"],
-            M=4 * c.kwargs["BLOCK_SIZE_H"],
+            K=k_infl * c.kwargs["BLOCK_SIZE_K"],
+            M=h_infl * c.kwargs["BLOCK_SIZE_H"],
             N=c.kwargs["BLOCK_SIZE_B"],
             num_stages=c.all_kwargs()["num_stages"],
         )
@@ -94,7 +103,7 @@ def prune_graph_configs(configs, named_args, **kwargs):
         if rmem > 3:
             continue
 
-        tile_size = 4 * c.kwargs["BLOCK_SIZE_H"] * c.kwargs["BLOCK_SIZE_B"]
+        tile_size = h_infl * c.kwargs["BLOCK_SIZE_H"] * c.kwargs["BLOCK_SIZE_B"]
 
         if tile_size <= 256:
             target_num_warps = [1]
@@ -121,10 +130,10 @@ def prune_graph_configs(configs, named_args, **kwargs):
         configs_new += [c]
 
     def _mm_intensity(c):
-        M = 4 * c.kwargs["BLOCK_SIZE_H"]
+        M = h_infl * c.kwargs["BLOCK_SIZE_H"]
         N = c.kwargs["BLOCK_SIZE_B"]
         K = (
-            c.kwargs.get("k_steps", triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_K"]))
+            triton.cdiv(k_infl * hidden_size, c.kwargs["BLOCK_SIZE_K"])
             * c.kwargs["BLOCK_SIZE_K"]
         )
         return M * N * K / (M * N + K * M + K * N)
@@ -159,10 +168,14 @@ def prune_persistent_configs(configs, named_args, **kwargs):
         )
     ]
     assert len(configs) > 0, "Problem with block_size_h filter"
+    h_infl = 4
+    k_infl = 1
     # standard persistent kernel
     if "RELOAD_WEIGHTS" in kwargs:
         for c in configs:
-            c.kwargs["k_steps"] = triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_K"])
+            c.kwargs["k_steps"] = triton.cdiv(
+                k_infl * hidden_size, c.kwargs["BLOCK_SIZE_K"]
+            )
 
         # RELOAD means weights are reloaded every time-step
         # this reduces shared memory pressues and relies on cache instead
@@ -187,6 +200,8 @@ def prune_persistent_configs(configs, named_args, **kwargs):
         assert len(configs) > 0
     else:
         # that's the bwd pass
+        h_infl = 1
+        k_infl = 4
         pass
 
     # filter batch-size related things
@@ -200,8 +215,8 @@ def prune_persistent_configs(configs, named_args, **kwargs):
 
         rmem = naive_smem_estimation(
             n_bytes=2 if kwargs["dtype"].endswith("16") else 4,
-            K=c.kwargs["BLOCK_SIZE_K"],
-            M=4 * c.kwargs["BLOCK_SIZE_H"],
+            K=k_infl * c.kwargs["BLOCK_SIZE_K"],
+            M=h_infl * c.kwargs["BLOCK_SIZE_H"],
             N=c.kwargs["BLOCK_SIZE_B"],
             num_stages=c.all_kwargs()["num_stages"],
         )
@@ -209,7 +224,7 @@ def prune_persistent_configs(configs, named_args, **kwargs):
         if rmem > 3:
             continue
 
-        tile_size = 4 * c.kwargs["BLOCK_SIZE_H"] * c.kwargs["BLOCK_SIZE_B"]
+        tile_size = h_infl * c.kwargs["BLOCK_SIZE_H"] * c.kwargs["BLOCK_SIZE_B"]
 
         if tile_size <= 256:
             target_num_warps = [1]
@@ -246,10 +261,12 @@ def prune_persistent_configs(configs, named_args, **kwargs):
         configs_new += [c]
 
     def _mm_intensity(c):
-        M = 4 * c.kwargs["BLOCK_SIZE_H"]
+        M = h_infl * c.kwargs["BLOCK_SIZE_H"]
         N = c.kwargs["BLOCK_SIZE_B"]
         K = (
-            c.kwargs.get("k_steps", triton.cdiv(hidden_size, c.kwargs["BLOCK_SIZE_K"]))
+            c.kwargs.get(
+                "k_steps", triton.cdiv(k_infl * hidden_size, c.kwargs["BLOCK_SIZE_K"])
+            )
             * c.kwargs["BLOCK_SIZE_K"]
         )
         return M * N * K / (M * N + K * M + K * N)

@@ -1492,6 +1492,7 @@ def lstm_full_Wgrad(
 @triton.autotune(
     configs=configs.get_graph_autotune_configs(),
     key=["batch_size", "hidden_size", "dtype"],
+    prune_configs_by={"early_config_prune": configs.prune_graph_configs},
 )
 @triton.jit
 def lstm_overlap_bwd(
