@@ -280,8 +280,8 @@ def get_persistent_autotune_configs():
     """
     Define a huge grid of possibly interesting configs.
 
-    prune_persistent_bwd_configs then selects the reasonable ones
-    and modified `num_pid_b` and `batch_chunks` accordingly
+    prune_persistent_configs then selects the reasonable ones
+    and modifies `num_pid_b` and `batch_chunks` accordingly
     """
     configs = [
         triton.Config(

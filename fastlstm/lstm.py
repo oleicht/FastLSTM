@@ -27,7 +27,7 @@ dtype_str = {
 }
 
 
-def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=None):
+def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, version=None):
     torch.cuda.nvtx.range_push("fwd setup")
     if x.dim() == 2:
         x = x[None]
@@ -90,36 +90,6 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("kernel setup")
-    # if triton_config is None:
-    #     # RTX 2000 Ada
-    #     BLOCK_SIZE_H = 8
-    #     BLOCK_SIZE_B = 32
-    #     BLOCK_SIZE_K = 32
-    #     GROUP_SIZE_B = 8
-    #     num_warps = 2
-
-    #     if hidden_size <= 256:
-    #         num_stages = 6
-    #     elif hidden_size <= 512:
-    #         num_stages = 4
-    #     else:
-    #         num_stages = 2
-
-    #     H100
-    #     BLOCK_SIZE_H = 32
-    #     BLOCK_SIZE_B = 32
-    #     BLOCK_SIZE_K = 32
-    #     GROUP_SIZE_B = 8
-    #     num_warps = 2
-    #     num_stages = 6
-
-    # else:
-    #     BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-    #     BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-    #     BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-    #     GROUP_SIZE_B = triton_config["GROUP_SIZE_B"]
-    #     num_warps = triton_config["num_warps"]
-    #     num_stages = triton_config["num_stages"]
 
     grid = configs.compute_persistent_grid_dim
     global_sync = torch.zeros(
@@ -176,7 +146,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None, version=N
     return out, cell, ifgo
 
 
-def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
+def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh):
     torch.cuda.nvtx.range_push("fwd_start")
     if x.dim() == 2:
         x = x[None]
@@ -207,36 +177,6 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("triton_start")
-    # if triton_config is None:
-    #     RTX 2000 Ada
-    #     BLOCK_SIZE_H = 8
-    #     BLOCK_SIZE_B = 32
-    #     BLOCK_SIZE_K = 32
-    #     GROUP_SIZE_B = 8
-    #     num_warps = 2
-    #     num_stages = 1
-
-    #     if batch_size > 32:
-    #         BLOCK_SIZE_B = 64
-
-    #     # H100
-    #     BLOCK_SIZE_H = 32
-    #     BLOCK_SIZE_B = 64
-    #     BLOCK_SIZE_K = 64
-    #     GROUP_SIZE_B = 8
-    #     num_warps = 4
-    #     num_stages = 6
-
-    # else:
-    #     BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-    #     BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-    #     BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-    #     GROUP_SIZE_B = triton_config["GROUP_SIZE_B"]
-    #     num_warps = triton_config["num_warps"]
-    #     num_stages = triton_config["num_stages"]
-    # grid = (
-    #     triton.cdiv(batch_size, BLOCK_SIZE_B) * triton.cdiv(hidden_size, BLOCK_SIZE_H),
-    # )
 
     grid = lambda META: (
         triton.cdiv(batch_size, META["BLOCK_SIZE_B"])
@@ -261,12 +201,6 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
             offset_ptr=offset,
             batch_size=batch_size,
             hidden_size=hidden_size,
-            # BLOCK_SIZE_B=BLOCK_SIZE_B,
-            # BLOCK_SIZE_K=BLOCK_SIZE_K,
-            # BLOCK_SIZE_H=BLOCK_SIZE_H,
-            # GROUP_SIZE_B=GROUP_SIZE_B,
-            # num_warps=num_warps,
-            # num_stages=num_stages,
             dtype=dtype,
         )
         if TRACK_AUTOTUNE_RUNTIMES:
@@ -287,12 +221,6 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
             offset_ptr=offset,
             batch_size=batch_size,
             hidden_size=hidden_size,
-            # BLOCK_SIZE_B=BLOCK_SIZE_B,
-            # BLOCK_SIZE_K=BLOCK_SIZE_K,
-            # BLOCK_SIZE_H=BLOCK_SIZE_H,
-            # GROUP_SIZE_B=GROUP_SIZE_B,
-            # num_warps=num_warps,
-            # num_stages=num_stages,
             dtype=dtype,
         )
         offset.add_(1)
@@ -305,7 +233,7 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     return out, cell, ifgo
 
 
-def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=None):
+def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh):
     torch.cuda.nvtx.range_push("persistent bwd init")
     d_ifgo = torch.empty_like(ifgo)
 
@@ -313,55 +241,9 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
 
     dh = dh.contiguous()
 
-    if triton_config is not None:
-        BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-        BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-        BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-        num_warps = triton_config["num_warps"]
-        num_stages = triton_config["num_stages"]
-
-        BLOCK_SIZE_H2 = triton_config["BLOCK_SIZE_H2"]
-        BLOCK_SIZE_B2 = triton_config["BLOCK_SIZE_B2"]
-        BLOCK_SIZE_K2 = triton_config["BLOCK_SIZE_K2"]
-        num_warps2 = triton_config["num_warps2"]
-        num_stages2 = triton_config["num_stages2"]
-
-    else:
-        BLOCK_SIZE_H = 32
-        BLOCK_SIZE_B = 32
-        BLOCK_SIZE_K = 64
-        num_warps = 4
-        if hidden_size < 512:
-            num_stages = 6
-        elif hidden_size < 1024:
-            num_stages = 4
-        else:
-            num_stages = 3
-
-        BLOCK_SIZE_H2 = 32
-        BLOCK_SIZE_B2 = 32
-        BLOCK_SIZE_K2 = 64
-        num_warps2 = 4
-        num_stages2 = 2
-
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("persistent bwd grid setup")
 
-    # num_b_splits = triton.cdiv(batch_size, BLOCK_SIZE_B)
-    # max_grid_size = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-    # while triton.cdiv(hidden_size, BLOCK_SIZE_H) > max_grid_size:
-    #     BLOCK_SIZE_H *= 2
-    # num_h_splits = triton.cdiv(hidden_size, BLOCK_SIZE_H)
-
-    # num_batch_iter = 1
-    # while (
-    #     num_h_splits * triton.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B)
-    #     > max_grid_size
-    # ):
-    #     num_batch_iter += 1
-
-    # Pgrid = (num_h_splits * triton.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B),)
     Pgrid = configs.compute_persistent_grid_dim
 
     sync = torch.zeros((seq_len * batch_size), dtype=torch.int, device=x.device)
@@ -452,18 +334,7 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
     return d_x, dh_n, dc_n, dWx, dbx, dWh, dbh
 
 
-def lstm_graph_bwd(
-    dh,
-    dc_n,
-    dh_n,
-    x,
-    h,
-    cell,
-    ifgo,
-    Wx,
-    Wh,
-    triton_config=None,
-):
+def lstm_graph_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh):
     torch.cuda.nvtx.range_push("graph bwd init")
     d_ifgo = torch.empty_like(ifgo)
 
@@ -482,30 +353,6 @@ def lstm_graph_bwd(
     # assert cell.shape == (seq_len + 1, batch_size, hidden_size)
     # assert dc_n.shape == (batch_size, hidden_size)
     # assert Wx.shape == (4 * hidden_size, input_size)
-
-    # if triton_config is not None:
-    #     BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-    #     BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-    #     BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-    #     num_warps = triton_config["num_warps"]
-    #     num_stages = triton_config["num_stages"]
-    #     overlap_version = triton_config.get("overlap_version", True)
-
-    # else:
-    #     BLOCK_SIZE_H = 32
-    #     BLOCK_SIZE_B = 32
-    #     BLOCK_SIZE_K = 64
-    #     num_warps = 4
-    #     num_stages = 4
-    #     overlap_version = True  # makes small problems ~5% faster and large ones <1%
-
-    # grid1 = (
-    #     triton.cdiv(hidden_size, BLOCK_SIZE_H) * triton.cdiv(batch_size, BLOCK_SIZE_B),
-    # )
-    # point_grid = (
-    #     triton.cdiv(hidden_size, 32),
-    #     triton.cdiv(batch_size, 32),
-    # )
 
     grid = lambda META: (
         triton.cdiv(hidden_size, META["BLOCK_SIZE_H"])
@@ -655,21 +502,9 @@ def Wgrad(d_ifgo, x, h):
 
 
 class PersistentLSTMfn(torch.autograd.Function):
-    FWD_TRITON_CONFIG = None
-    BWD_TRITON_CONFIG = None
-
     @staticmethod
     def forward(ctx, x, h_0, c_0, Wx, bx, Wh, bh):
-        out, cell, ifgo = lstm_persistent_fwd(
-            x,
-            h_0,
-            c_0,
-            Wx,
-            bx,
-            Wh,
-            bh,
-            triton_config=PersistentLSTMfn.FWD_TRITON_CONFIG,
-        )
+        out, cell, ifgo = lstm_persistent_fwd(x, h_0, c_0, Wx, bx, Wh, bh)
         ctx.h0_is_nan = h_0 is None
         ctx.save_for_backward(x, out, cell, ifgo, Wx, Wh)
         # first one is initial condition
@@ -683,16 +518,7 @@ class PersistentLSTMfn(torch.autograd.Function):
         else:
             raise ValueError("Not implemented")
         d_x, dh_0, dc_0, dWx, dbx, dWh, dbh = lstm_persistent_bwd(
-            dh,
-            dc_n,
-            dh_n,
-            x,
-            out,
-            cell,
-            ifgo,
-            Wx,
-            Wh,
-            triton_config=PersistentLSTMfn.BWD_TRITON_CONFIG,
+            dh, dc_n, dh_n, x, out, cell, ifgo, Wx, Wh
         )
         if ctx.h0_is_nan:
             dh_0 = None
@@ -701,15 +527,10 @@ class PersistentLSTMfn(torch.autograd.Function):
 
 
 class GraphLSTMfn(torch.autograd.Function):
-    FWD_TRITON_CONFIG = None
-    BWD_TRITON_CONFIG = None
-
     @staticmethod
     def forward(ctx, x, h_0, c_0, Wx, bx, Wh, bh):
         torch.cuda.nvtx.range_push("graph_fwd")
-        out, cell, ifgo = lstm_graph_fwd(
-            x, h_0, c_0, Wx, bx, Wh, bh, triton_config=GraphLSTMfn.FWD_TRITON_CONFIG
-        )
+        out, cell, ifgo = lstm_graph_fwd(x, h_0, c_0, Wx, bx, Wh, bh)
         ctx.save_for_backward(x, out, cell, ifgo, Wx, Wh)
         ctx.h0_is_nan = h_0 is None
         out = out[1:]  # first one is initial condition
@@ -726,16 +547,7 @@ class GraphLSTMfn(torch.autograd.Function):
             raise ValueError("Not implemented")
 
         d_x, dh_0, dc_0, dWx, dbx, dWh, dbh = lstm_graph_bwd(
-            dh,
-            dc_n,
-            dh_n,
-            x,
-            out,
-            cell,
-            ifgo,
-            Wx,
-            Wh,
-            triton_config=GraphLSTMfn.BWD_TRITON_CONFIG,
+            dh, dc_n, dh_n, x, out, cell, ifgo, Wx, Wh
         )
         if ctx.h0_is_nan:
             dh_0 = None
@@ -911,15 +723,7 @@ class FlashLSTM(nn.Module):
 #######################################################################################
 ################# versions below were experimental and aren't performant ##############
 #######################################################################################
-def lstm_v1_fwd(
-    x,
-    h0,
-    c0,
-    Wx,
-    bx,
-    Wh,
-    bh,
-):
+def lstm_v1_fwd(x, h0, c0, Wx, bx, Wh, bh):
     if x.dim() == 2:
         x = x[None]
 
