@@ -1,4 +1,5 @@
 from itertools import product
+import json
 from functools import partial
 from pathlib import Path
 
@@ -6,6 +7,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from triton.compiler.errors import CompilationError
+from triton.runtime.errors import OutOfResources
 from triton.testing import do_bench
 from tqdm import tqdm
 
@@ -19,9 +22,14 @@ def generate_configs():
     - hidden_size = [64 ... 2048]
     """
     configs = {}
-    for seq_len, bs, hs, layer in product(range(5), range(6), range(6), range(1)):
-        name = f"s{seq_len}_b{bs}_h{hs}_l{layer}"
+    for bs, hs, layer, seq_len in product(
+        range(5, -1, -1), range(5, -1, -1), range(1), range(4, 5)
+    ):
+        name = f"s{64 << seq_len}_b{4 << bs}_h{64 << hs}_l{1 + layer}"
         configs[name] = (64 << seq_len, 4 << bs, 64 << hs, 1 + layer)
+
+        # name = f"s{64 << seq_len}_b{4 << bs}_h768_l{1 + layer}"
+        # configs[name] = (64 << seq_len, 4 << bs, 768, 1 + layer)
 
     return configs
 
@@ -33,7 +41,7 @@ def run_benchmark(config, models, mode, dtype=None):
 
     x = torch.randn((seq_len, batch_size, hidden_size), device="cuda", dtype=dtype)
     for model in models:
-        if model.lower() != "lstm":
+        if model.lower() in ["graph", "persistent"]:
             m = flstm.FastLSTM(
                 input_size=hidden_size,
                 hidden_size=hidden_size,
@@ -41,6 +49,14 @@ def run_benchmark(config, models, mode, dtype=None):
                 num_layers=num_layers,
                 version=model,
                 dtype=dtype,
+            )
+        elif model.lower() in ["cuda", "cuda_fused", "triton_fused"]:
+            m = flstm.FlashLSTM(
+                input_size=hidden_size,
+                hidden_size=hidden_size,
+                device="cuda",
+                dtype=dtype,
+                backend=model.lower(),
             )
         else:
             m = nn.LSTM(
@@ -115,29 +131,45 @@ def run_benchmark(config, models, mode, dtype=None):
 
         try:
             t = do_bench(fn, return_mode="median", warmup=int(warmup), rep=int(rep))
-        except (torch.OutOfMemoryError, torch.AcceleratorError):
+        except (
+            torch.OutOfMemoryError,
+            torch.AcceleratorError,
+            CompilationError,
+            OutOfResources,
+            ValueError,
+        ):
             t = np.nan
+        torch.cuda.synchronize()
         medians += [t]
     return medians
 
 
 if __name__ == "__main__":
-    fname = "bf16"
+    fname = "bench"
     overwrite = False
-    dtype = [None, torch.bfloat16, torch.float16][1]
+    dtype = [None, torch.bfloat16, torch.float16][2]
 
-    for mode in ["fwd", "full", "bwd"][1:2]:
-        if not overwrite and Path(f"{mode}_{fname}.parquet").exists():
+    flstm.TRACK_AUTOTUNE_RUNTIMES = True
+
+    for mode in ["fwd", "full", "bwd"][:2]:
+        p = Path(f"{mode}_{fname}.parquet")
+        if not overwrite and p.exists():
             raise ValueError(f"File {mode}_{fname} exists")
         models = [
-            "graph",
             "persistent",
+            # "grapph"
         ]
+
+        if True:
+            models += [
+                "cuda",
+                "cuda_fused",
+                "triton_fused",
+            ]
 
         if mode != "bwd":
             models += [
                 "lstm",
-                "fast",
             ]
 
         bench = partial(run_benchmark, models=models, mode=mode, dtype=dtype)
@@ -146,4 +178,9 @@ if __name__ == "__main__":
         for name, config in tqdm(generate_configs().items(), total=len(configs)):
             res[tuple(name.split("_"))] = bench(config)
 
-        pd.DataFrame(res, index=models).T.to_parquet(f"{mode}_{fname}.parquet")
+            # overwrite existing file every time a config finishes
+            pd.DataFrame(res, index=models).T.to_parquet(p)
+
+            if flstm.TRACK_AUTOTUNE_RUNTIMES:
+                with open(f"tuning_{mode}_{fname}.json", "w") as fh:
+                    json.dump(flstm.CONFIG_RES, fh, default=str, indent=2)

@@ -1,11 +1,16 @@
+from collections import defaultdict
 from functools import partial
+from importlib import reload
+import math
 
 import torch
+from torch.amp import custom_fwd, custom_bwd
 import torch.nn as nn
 import triton
 
 import fastlstm.kernels as kernels
-
+import fastlstm.configs as configs
+from flashrnn import flashrnn
 
 torch.backends.fp32_precision = "tf32"
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -13,6 +18,8 @@ torch.backends.cudnn.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
 torch.backends.cudnn.rnn.fp32_precision = "tf32"
 
+TRACK_AUTOTUNE_RUNTIMES = False
+CONFIG_RES = defaultdict(list)
 
 dtype_str = {
     torch.float32: "fp32",
@@ -21,21 +28,51 @@ dtype_str = {
 }
 
 
-def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
+def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, version=None):
     torch.cuda.nvtx.range_push("fwd setup")
     if x.dim() == 2:
         x = x[None]
 
-    seq_len = x.shape[0]
-    batch_size = x.shape[1]
+    dtype = dtype_str[x.dtype]
+    seq_len, batch_size, input_size = x.shape
     hidden_size = Wh.shape[1]
+    size = max(hidden_size, input_size)
+    if version is None:
+        # should be more general: the idea here is finding out whether W @ x is memory bound too
+        # fp32 -> use fully fused <= 64
+        # half prec; use <= 128
+        if size <= (1 + dtype.endswith("16")) * 32:
+            version = 3
+        else:
+            version = 1
+
     assert x.is_contiguous()
     assert Wh.is_contiguous()
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("ifgo")
-    ifgo = torch.addmm(
-        bx + bh, x.view(seq_len * batch_size, -1), Wx.T, beta=1.0, alpha=1.0
-    ).view(seq_len, batch_size, -1)
+    if version == 3:
+        ifgo = torch.empty(
+            (seq_len, batch_size, 4 * hidden_size), device=x.device, dtype=x.dtype
+        )
+        extra_args = {
+            "input_size": input_size,
+            "x_ptr": x,
+            "W_x_ptr": Wx,
+            "b_x_ptr": bx,
+            "b_h_ptr": bh,
+        }
+
+    else:
+        ifgo = torch.addmm(
+            bx + bh, x.view(seq_len * batch_size, -1), Wx.T, beta=1.0, alpha=1.0
+        ).view(seq_len, batch_size, -1)
+        if version == 1:
+            extra_args = {
+                "RELOAD_WEIGHTS": hidden_size > 64 * (1 + dtype.endswith("16"))
+            }
+
+        else:
+            extra_args = {}
 
     assert ifgo.stride(1) == 4 * hidden_size
     assert ifgo.stride(2) == 1
@@ -54,60 +91,44 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("kernel setup")
-    if triton_config is None:
-        BLOCK_SIZE_H = 8
-        BLOCK_SIZE_B = 32
-        BLOCK_SIZE_K = 32
-        GROUP_SIZE_B = 8
-        num_warps = 2
 
-        if hidden_size <= 256:
-            num_stages = 6
-        elif hidden_size <= 512:
-            num_stages = 4
-        else:
-            num_stages = 2
-
-    else:
-        BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-        BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-        BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-        GROUP_SIZE_B = triton_config["GROUP_SIZE_B"]
-        num_warps = triton_config["num_warps"]
-        num_stages = triton_config["num_stages"]
-
-    # 22 for rtx_2000_ada
-    max_grid_size = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-    # modify BLOCK_SIZES to prevent deadlocks. Assumption: one program per SM
-    while triton.cdiv(hidden_size, BLOCK_SIZE_H) > max_grid_size:
-        BLOCK_SIZE_H *= 2
-
-    num_pid_h = triton.cdiv(hidden_size, BLOCK_SIZE_H)
-    num_pid_b = triton.cdiv(batch_size, BLOCK_SIZE_B)
-    b_multi = 1
-    b_offset = 0
-    if num_pid_h * num_pid_b > max_grid_size:
-        num_pid_b = triton.next_power_of_2(num_pid_b) // 2
-        b_multi *= 2
-        while num_pid_h * num_pid_b > max_grid_size:
-            num_pid_b //= 2
-            b_multi *= 2
-        b_offset = num_pid_b
-
-    grid = (num_pid_b * num_pid_h,)
+    grid = configs.compute_persistent_grid_dim
     global_sync = torch.zeros(
-        (
-            seq_len,
-            triton.cdiv(batch_size, BLOCK_SIZE_B),
-        ),
+        seq_len * batch_size,
         dtype=torch.int,
         device=x.device,
     )
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("run kernel")
-    kernels.persistent_fwd_kernel[grid](
+    match version:
+        case 1:
+            kernel = kernels.persistent_fwd_kernel
+        case 2:
+            kernel = kernels.persistent_fwd_kernel_v2
+        case 3:
+            kernel = kernels.fully_fused_persistent_fwd_kernel
+
+    if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernel.cache):
+        kernel[grid](
+            ifgo_ptr=torch.randn_like(ifgo),  # ifgo gets overwritten
+            cell_ptr=cell,
+            h_ptr=out,
+            W_h_ptr=Wh,
+            seq_len=min(6, seq_len),
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            global_sync_ptr=torch.zeros_like(global_sync),
+            dtype=dtype_str[ifgo.dtype],
+            **extra_args,
+        )
+        if TRACK_AUTOTUNE_RUNTIMES:
+            for k, v in kernel.configs_timings.items():
+                CONFIG_RES[f"persistent-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                    (str(k), v)
+                ]
+
+    kernel[grid](
         ifgo_ptr=ifgo,
         cell_ptr=cell,
         h_ptr=out,
@@ -116,15 +137,8 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
         batch_size=batch_size,
         hidden_size=hidden_size,
         global_sync_ptr=global_sync,
-        b_multi=b_multi,
-        b_offset=b_offset,
-        dtype=dtype_str[ifgo.dtype],
-        BLOCK_SIZE_B=BLOCK_SIZE_B,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        BLOCK_SIZE_H=BLOCK_SIZE_H,
-        GROUP_SIZE_B=GROUP_SIZE_B,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        dtype=dtype,
+        **extra_args,
     )
 
     torch.cuda.nvtx.range_pop()
@@ -132,7 +146,7 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
     return out, cell, ifgo
 
 
-def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
+def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh):
     torch.cuda.nvtx.range_push("fwd_start")
     if x.dim() == 2:
         x = x[None]
@@ -163,84 +177,63 @@ def lstm_graph_fwd(x, h0, c0, Wx, bx, Wh, bh, triton_config=None):
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("triton_start")
-    if triton_config is None:
-        BLOCK_SIZE_H = 8
-        BLOCK_SIZE_B = 32
-        BLOCK_SIZE_K = 32
-        GROUP_SIZE_B = 8
-        num_warps = 2
-        num_stages = 1
 
-        if batch_size > 32:
-            BLOCK_SIZE_B = 64
-
-    else:
-        BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-        BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-        BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-        GROUP_SIZE_B = triton_config["GROUP_SIZE_B"]
-        num_warps = triton_config["num_warps"]
-        num_stages = triton_config["num_stages"]
-
-    grid = (
-        triton.cdiv(batch_size, BLOCK_SIZE_B) * triton.cdiv(hidden_size, BLOCK_SIZE_H),
+    grid = lambda META: (
+        triton.cdiv(batch_size, META["BLOCK_SIZE_B"])
+        * triton.cdiv(hidden_size, META["BLOCK_SIZE_H"]),
     )
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("warmup")
 
     offset = torch.zeros((1,), device=x.device, dtype=torch.int)
-    # warmup / compile
-    kernels.one_step_fwd[grid](
-        ifgo_ptr=ifgo,
-        cell_ptr=cell,
-        h_ptr=out,
-        W_h_ptr=Wh,
-        offset_ptr=offset,
-        batch_size=batch_size,
-        hidden_size=hidden_size,
-        BLOCK_SIZE_B=BLOCK_SIZE_B,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        BLOCK_SIZE_H=BLOCK_SIZE_H,
-        GROUP_SIZE_B=GROUP_SIZE_B,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        dtype=dtype_str[ifgo.dtype],
-    )
+    dtype = dtype_str[ifgo.dtype]
+
+    # if the config hasn't run yet: autotune the kernel
+    if not any(
+        (batch_size, hidden_size, dtype) == k[:3] for k in kernels.one_step_fwd.cache
+    ):
+        kernels.one_step_fwd[grid](
+            ifgo_ptr=torch.randn_like(ifgo),  # ifgo gets overwritten
+            cell_ptr=cell,
+            h_ptr=out,
+            W_h_ptr=Wh,
+            offset_ptr=offset,
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        if TRACK_AUTOTUNE_RUNTIMES:
+            for k, v in kernels.one_step_fwd.configs_timings.items():
+                CONFIG_RES[f"graph-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                    (str(k), v)
+                ]
     torch.cuda.nvtx.range_pop()
 
-    if seq_len > 1:
-        torch.cuda.nvtx.range_push("graph capture")
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            offset.add_(1)
-            kernels.one_step_fwd[grid](
-                ifgo_ptr=ifgo,
-                cell_ptr=cell,
-                h_ptr=out,
-                W_h_ptr=Wh,
-                offset_ptr=offset,
-                batch_size=batch_size,
-                hidden_size=hidden_size,
-                BLOCK_SIZE_B=BLOCK_SIZE_B,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                BLOCK_SIZE_H=BLOCK_SIZE_H,
-                GROUP_SIZE_B=GROUP_SIZE_B,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                dtype=dtype_str[ifgo.dtype],
-            )
-        torch.cuda.nvtx.range_pop()
-        torch.cuda.nvtx.range_push("replay")
-
-        for _ in range(seq_len - 1):
-            g.replay()
-        torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("graph capture")
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        kernels.one_step_fwd[grid](
+            ifgo_ptr=ifgo,
+            cell_ptr=cell,
+            h_ptr=out,
+            W_h_ptr=Wh,
+            offset_ptr=offset,
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            dtype=dtype,
+        )
+        offset.add_(1)
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("replay")
+    for _ in range(seq_len):
+        g.replay()
+    torch.cuda.nvtx.range_pop()
 
     return out, cell, ifgo
 
 
-def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=None):
+def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh):
     torch.cuda.nvtx.range_push("persistent bwd init")
     d_ifgo = torch.empty_like(ifgo)
 
@@ -248,60 +241,40 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
 
     dh = dh.contiguous()
 
-    if triton_config is not None:
-        BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-        BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-        BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-        num_warps = triton_config["num_warps"]
-        num_stages = triton_config["num_stages"]
-
-        BLOCK_SIZE_H2 = triton_config["BLOCK_SIZE_H2"]
-        BLOCK_SIZE_B2 = triton_config["BLOCK_SIZE_B2"]
-        BLOCK_SIZE_K2 = triton_config["BLOCK_SIZE_K2"]
-        num_warps2 = triton_config["num_warps2"]
-        num_stages2 = triton_config["num_stages2"]
-
-    else:
-        BLOCK_SIZE_H = 32
-        BLOCK_SIZE_B = 32
-        BLOCK_SIZE_K = 64
-        num_warps = 4
-        if hidden_size < 512:
-            num_stages = 6
-        elif hidden_size < 1024:
-            num_stages = 4
-        else:
-            num_stages = 3
-
-        BLOCK_SIZE_H2 = 32
-        BLOCK_SIZE_B2 = 32
-        BLOCK_SIZE_K2 = 64
-        num_warps2 = 4
-        num_stages2 = 2
-
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("persistent bwd grid setup")
-    num_b_splits = triton.cdiv(batch_size, BLOCK_SIZE_B)
-    max_grid_size = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    while triton.cdiv(hidden_size, BLOCK_SIZE_H) > max_grid_size:
-        BLOCK_SIZE_H *= 2
-    num_h_splits = triton.cdiv(hidden_size, BLOCK_SIZE_H)
+    Pgrid = configs.compute_persistent_grid_dim
 
-    num_batch_iter = 1
-    while (
-        num_h_splits * triton.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B)
-        > max_grid_size
-    ):
-        num_batch_iter += 1
-
-    Pgrid = (num_h_splits * triton.cdiv(batch_size, num_batch_iter * BLOCK_SIZE_B),)
-
-    sync = torch.zeros((seq_len, num_b_splits), dtype=torch.int, device=x.device)
+    sync = torch.zeros((seq_len * batch_size), dtype=torch.int, device=x.device)
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("persistent bwd kernel")
-    kernels.lstm_persistent_seq_bwd[Pgrid](
+    dtype = dtype_str[ifgo.dtype]
+    kernel = kernels.lstm_persistent_seq_bwd
+
+    if not any((batch_size, hidden_size, dtype) == k[:3] for k in kernel.cache):
+        kernel[Pgrid](
+            d_out_ptr=dh,
+            d_h_ptr=torch.randn_like(dh_n),
+            d_c_ptr=torch.randn_like(dc_n),
+            d_ifgo_ptr=d_ifgo,
+            ifgo_ptr=ifgo,
+            cell_ptr=cell,
+            Wh_ptr=Wh,
+            sync_ptr=torch.zeros_like(sync),
+            batch_size=batch_size,
+            hidden_size=hidden_size,
+            seq_len=min(seq_len, 6),
+            dtype=dtype,
+        )
+        if TRACK_AUTOTUNE_RUNTIMES:
+            for k, v in kernel.configs_timings.items():
+                CONFIG_RES[f"persistentBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                    (str(k), v)
+                ]
+
+    kernel[Pgrid](
         d_out_ptr=dh,
         d_h_ptr=dh_n,
         d_c_ptr=dc_n,
@@ -310,16 +283,10 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
         cell_ptr=cell,
         Wh_ptr=Wh,
         sync_ptr=sync,
-        num_batch_iter=num_batch_iter,
         batch_size=batch_size,
         hidden_size=hidden_size,
         seq_len=seq_len,
-        BLOCK_SIZE_H=BLOCK_SIZE_H,
-        BLOCK_SIZE_B=BLOCK_SIZE_B,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        dtype=dtype_str[ifgo.dtype],
+        dtype=dtype,
     )
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("matmuls for gradients")
@@ -367,18 +334,7 @@ def lstm_persistent_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, triton_config=
     return d_x, dh_n, dc_n, dWx, dbx, dWh, dbh
 
 
-def lstm_graph_bwd(
-    dh,
-    dc_n,
-    dh_n,
-    x,
-    h,
-    cell,
-    ifgo,
-    Wx,
-    Wh,
-    triton_config=None,
-):
+def lstm_graph_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh):
     torch.cuda.nvtx.range_push("graph bwd init")
     d_ifgo = torch.empty_like(ifgo)
 
@@ -390,109 +346,108 @@ def lstm_graph_bwd(
 
     dh = dh.contiguous()
 
-    assert ifgo.is_contiguous()
-    assert cell.is_contiguous()
-    assert ifgo.shape == (seq_len, batch_size, 4 * hidden_size)
-    assert dh.shape == (seq_len, batch_size, hidden_size)
-    assert cell.shape == (seq_len + 1, batch_size, hidden_size)
-    assert dc_n.shape == (batch_size, hidden_size)
-    assert Wx.shape == (4 * hidden_size, input_size)
+    # assert ifgo.is_contiguous()
+    # assert cell.is_contiguous()
+    # assert ifgo.shape == (seq_len, batch_size, 4 * hidden_size)
+    # assert dh.shape == (seq_len, batch_size, hidden_size)
+    # assert cell.shape == (seq_len + 1, batch_size, hidden_size)
+    # assert dc_n.shape == (batch_size, hidden_size)
+    # assert Wx.shape == (4 * hidden_size, input_size)
 
-    if triton_config is not None:
-        BLOCK_SIZE_H = triton_config["BLOCK_SIZE_H"]
-        BLOCK_SIZE_B = triton_config["BLOCK_SIZE_B"]
-        BLOCK_SIZE_K = triton_config["BLOCK_SIZE_K"]
-        num_warps = triton_config["num_warps"]
-        num_stages = triton_config["num_stages"]
-        overlap_version = triton_config.get("overlap_version", True)
-
-    else:
-        BLOCK_SIZE_H = 32
-        BLOCK_SIZE_B = 32
-        BLOCK_SIZE_K = 64
-        num_warps = 4
-        num_stages = 4
-        overlap_version = True  # makes small problems ~5% faster and large ones <1%
-
-    grid = (
-        triton.cdiv(hidden_size, BLOCK_SIZE_H) * triton.cdiv(batch_size, BLOCK_SIZE_B),
+    grid = lambda META: (
+        triton.cdiv(hidden_size, META["BLOCK_SIZE_H"])
+        * triton.cdiv(batch_size, META["BLOCK_SIZE_B"]),
     )
 
-    point_grid = (
-        triton.cdiv(hidden_size, 32),
-        triton.cdiv(batch_size, 32),
-    )
+    dtype = dtype_str[ifgo.dtype]
 
-    def run():
-        if overlap_version:
-            kernels.lstm_overlap_bwd[grid](
-                ifgo_ptr=ifgo,
-                cell_ptr=cell,
-                d_c_ptr=dc_n,
-                d_ifgo_ptr=d_ifgo,
-                d_out_ptr=dh,
-                Wh_ptr=Wh,
-                dh_n_ptr=dh_n,
-                hidden_size=hidden_size,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                offset_ptr=offset,
-                BLOCK_SIZE_B=BLOCK_SIZE_B,
-                BLOCK_SIZE_H=BLOCK_SIZE_H,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                GROUP_SIZE_M=8,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                dtype=dtype_str[ifgo.dtype],
-            )
-        offset.add_(-1)
-        if not overlap_version:
-            kernels.lstm_ifgo_bwd[point_grid](
-                d_out_ptr=dh,
-                d_h_ptr=dh_n,
-                cell_ptr=cell,
-                d_c_ptr=dc_n,
-                ifgo_ptr=ifgo,
-                d_ifgo_ptr=d_ifgo,
-                d_ifgo_stride=d_ifgo.stride(0),
-                offset_ptr=offset,
-                batch_size=batch_size,
-                hidden_size=hidden_size,
-                BLOCK_SIZE_H=32,
-                BLOCK_SIZE_B=32,
-                dtype=dtype_str[ifgo.dtype],
-            )
-            kernels.lstm_h_grad[grid](
-                d_ifgo_ptr=d_ifgo,
-                Wh_ptr=Wh,
-                dh_n_ptr=dh_n,
-                hidden_size=hidden_size,
-                batch_size=batch_size,
-                offset_ptr=offset,
-                BLOCK_SIZE_M=BLOCK_SIZE_H,
-                BLOCK_SIZE_N=BLOCK_SIZE_B,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                GROUP_SIZE_M=8,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                dtype=dtype_str[ifgo.dtype],
-            )
+    # def run_old():
+    #     offset.add_(-1)
+    #     kernels.lstm_ifgo_bwd[point_grid](
+    #         d_out_ptr=dh,
+    #         d_h_ptr=dh_n,
+    #         cell_ptr=cell,
+    #         d_c_ptr=dc_n,
+    #         ifgo_ptr=ifgo,
+    #         d_ifgo_ptr=d_ifgo,
+    #         d_ifgo_stride=d_ifgo.stride(0),
+    #         offset_ptr=offset,
+    #         batch_size=batch_size,
+    #         hidden_size=hidden_size,
+    #         BLOCK_SIZE_H=32,
+    #         BLOCK_SIZE_B=32,
+    #         dtype=dtype,
+    #     )
+    #     kernels.lstm_h_grad[grid1](
+    #         d_ifgo_ptr=d_ifgo,
+    #         Wh_ptr=Wh,
+    #         dh_n_ptr=dh_n,
+    #         hidden_size=hidden_size,
+    #         batch_size=batch_size,
+    #         offset_ptr=offset,
+    #         BLOCK_SIZE_M=BLOCK_SIZE_H,
+    #         BLOCK_SIZE_N=BLOCK_SIZE_B,
+    #         BLOCK_SIZE_K=BLOCK_SIZE_K,
+    #         GROUP_SIZE_M=8,
+    #         num_warps=num_warps,
+    #         num_stages=num_stages,
+    #         dtype=dtype,
+    #     )
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("graph bwd warmup")
-    run()
-    torch.cuda.nvtx.range_pop()
-    if seq_len > 1:
-        torch.cuda.nvtx.range_push("graph bwd capture kernel")
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            run()
-        torch.cuda.nvtx.range_pop()
+    if not any(
+        (batch_size, hidden_size, dtype) == k[:3]
+        for k in kernels.lstm_overlap_bwd.cache
+    ):
+        kernels.lstm_overlap_bwd[grid](
+            ifgo_ptr=ifgo,
+            cell_ptr=cell,
+            d_c_ptr=torch.randn_like(dc_n),
+            d_ifgo_ptr=d_ifgo,
+            d_out_ptr=dh,
+            Wh_ptr=Wh,
+            dh_n_ptr=2 * torch.randn_like(dh_n),
+            hidden_size=hidden_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            offset_ptr=torch.ones_like(offset),
+            dtype=dtype,
+        )
 
-        torch.cuda.nvtx.range_push("replay kernel")
-        for _ in range(seq_len - 1 + int(overlap_version)):
-            g.replay()
-        torch.cuda.nvtx.range_pop()
+        if TRACK_AUTOTUNE_RUNTIMES:
+            for k, v in kernels.lstm_overlap_bwd.configs_timings.items():
+                CONFIG_RES[f"graphBWD-h{hidden_size}-b{batch_size}-{dtype}"] += [
+                    (str(k), v)
+                ]
+
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("graph bwd capture kernel")
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        kernels.lstm_overlap_bwd[grid](
+            ifgo_ptr=ifgo,
+            cell_ptr=cell,
+            d_c_ptr=dc_n,
+            d_ifgo_ptr=d_ifgo,
+            d_out_ptr=dh,
+            Wh_ptr=Wh,
+            dh_n_ptr=dh_n,
+            hidden_size=hidden_size,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            offset_ptr=offset,
+            dtype=dtype,
+        )
+        offset.add_(-1)
+
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("replay kernel")
+    for _ in range(seq_len + 1):
+        g.replay()
+    torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("matmuls for gradients")
     d_x = d_ifgo @ Wx
@@ -547,27 +502,27 @@ def Wgrad(d_ifgo, x, h):
 
 
 class PersistentLSTMfn(torch.autograd.Function):
-    FWD_TRITON_CONFIG = None
-    BWD_TRITON_CONFIG = None
-
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(ctx, x, h_0, c_0, Wx, bx, Wh, bh):
-        out, cell, ifgo = lstm_persistent_fwd(
-            x,
-            h_0,
-            c_0,
-            Wx,
-            bx,
-            Wh,
-            bh,
-            triton_config=PersistentLSTMfn.FWD_TRITON_CONFIG,
-        )
+        torch.cuda.nvtx.range_push("persistent amp")
+        if torch.is_autocast_enabled():
+            target = torch.get_autocast_dtype("cuda")
+            x = x.to(target)
+            Wx = Wx.to(target)
+            Wh = Wh.to(target)
+            bx = bx.to(target)
+            bh = bh.to(target)
+        torch.cuda.nvtx.range_pop()
+
+        out, cell, ifgo = lstm_persistent_fwd(x, h_0, c_0, Wx, bx, Wh, bh)
         ctx.h0_is_nan = h_0 is None
         ctx.save_for_backward(x, out, cell, ifgo, Wx, Wh)
         # first one is initial condition
         return out[1:], (out[-1], cell[-1])
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dh, d_out_cell):
         x, out, cell, ifgo, Wx, Wh = ctx.saved_tensors
         if d_out_cell is None:
@@ -575,16 +530,7 @@ class PersistentLSTMfn(torch.autograd.Function):
         else:
             raise ValueError("Not implemented")
         d_x, dh_0, dc_0, dWx, dbx, dWh, dbh = lstm_persistent_bwd(
-            dh,
-            dc_n,
-            dh_n,
-            x,
-            out,
-            cell,
-            ifgo,
-            Wx,
-            Wh,
-            triton_config=PersistentLSTMfn.BWD_TRITON_CONFIG,
+            dh, dc_n, dh_n, x, out, cell, ifgo, Wx, Wh
         )
         if ctx.h0_is_nan:
             dh_0 = None
@@ -593,15 +539,21 @@ class PersistentLSTMfn(torch.autograd.Function):
 
 
 class GraphLSTMfn(torch.autograd.Function):
-    FWD_TRITON_CONFIG = None
-    BWD_TRITON_CONFIG = None
-
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(ctx, x, h_0, c_0, Wx, bx, Wh, bh):
+        torch.cuda.nvtx.range_push("graph_amp")
+        if torch.is_autocast_enabled():
+            target = torch.get_autocast_dtype("cuda")
+            x = x.to(target)
+            Wx = Wx.to(target)
+            Wh = Wh.to(target)
+            bx = bx.to(target)
+            bh = bh.to(target)
+        torch.cuda.nvtx.range_pop()
+
         torch.cuda.nvtx.range_push("graph_fwd")
-        out, cell, ifgo = lstm_graph_fwd(
-            x, h_0, c_0, Wx, bx, Wh, bh, triton_config=GraphLSTMfn.FWD_TRITON_CONFIG
-        )
+        out, cell, ifgo = lstm_graph_fwd(x, h_0, c_0, Wx, bx, Wh, bh)
         ctx.save_for_backward(x, out, cell, ifgo, Wx, Wh)
         ctx.h0_is_nan = h_0 is None
         out = out[1:]  # first one is initial condition
@@ -609,6 +561,7 @@ class GraphLSTMfn(torch.autograd.Function):
         return out, (out[-1], cell[-1])
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dh, d_out_cell):
         torch.cuda.nvtx.range_push("graph_bwd")
         x, out, cell, ifgo, Wx, Wh = ctx.saved_tensors
@@ -618,75 +571,7 @@ class GraphLSTMfn(torch.autograd.Function):
             raise ValueError("Not implemented")
 
         d_x, dh_0, dc_0, dWx, dbx, dWh, dbh = lstm_graph_bwd(
-            dh,
-            dc_n,
-            dh_n,
-            x,
-            out,
-            cell,
-            ifgo,
-            Wx,
-            Wh,
-            triton_config=GraphLSTMfn.BWD_TRITON_CONFIG,
-        )
-        if ctx.h0_is_nan:
-            dh_0 = None
-            dc_0 = None
-        torch.cuda.nvtx.range_pop()
-        return d_x, dh_0, dc_0, dWx, dbx, dWh, dbh
-
-
-class LSTMfn(torch.autograd.Function):
-    FWD_TRITON_CONFIG = None
-    BWD_TRITON_CONFIG = None
-
-    @staticmethod
-    def forward(ctx, x, h_0, c_0, Wx, bx, Wh, bh):
-        # select kernel
-        _, batch_size, hidden_size = x.shape
-        fn = lstm_graph_fwd
-        if hidden_size >= 1024:
-            fn = lstm_graph_fwd
-        elif (batch_size < 64) or (hidden_size <= 64):
-            fn = lstm_persistent_fwd
-        elif (hidden_size / 64) + (batch_size / 64) < 3.5:
-            fn = lstm_persistent_fwd
-
-        torch.cuda.nvtx.range_push("graph_fwd")
-        out, cell, ifgo = fn(
-            x, h_0, c_0, Wx, bx, Wh, bh, triton_config=LSTMfn.FWD_TRITON_CONFIG
-        )
-        ctx.save_for_backward(x, out, cell, ifgo, Wx, Wh)
-        ctx.h0_is_nan = h_0 is None
-        out = out[1:]  # first one is initial condition
-        torch.cuda.nvtx.range_pop()
-        return out, (out[-1], cell[-1])
-
-    @staticmethod
-    def backward(ctx, dh, d_out_cell):
-        # select kernel
-        if dh.shape[-1] < 1500:
-            fn = lstm_persistent_bwd
-        else:
-            fn = lstm_graph_bwd
-
-        torch.cuda.nvtx.range_push("graph_bwd")
-        x, out, cell, ifgo, Wx, Wh = ctx.saved_tensors
-        if d_out_cell is None:
-            dc_n, dh_n = torch.zeros_like(cell[:2]).unbind(0)
-        else:
-            raise ValueError("Not implemented")
-        d_x, dh_0, dc_0, dWx, dbx, dWh, dbh = fn(
-            dh,
-            dc_n,
-            dh_n,
-            x,
-            out,
-            cell,
-            ifgo,
-            Wx,
-            Wh,
-            triton_config=LSTMfn.BWD_TRITON_CONFIG,
+            dh, dc_n, dh_n, x, out, cell, ifgo, Wx, Wh
         )
         if ctx.h0_is_nan:
             dh_0 = None
@@ -704,7 +589,7 @@ class FastLSTM(nn.Module):
         input_size,
         hidden_size,
         num_layers=1,
-        version="fast",
+        version="persistent",
         device=None,
         dtype=None,
     ):
@@ -786,14 +671,12 @@ class FastLSTM(nn.Module):
         c_n = []
 
         match self.version:
-            case "naive-pt":
-                fn = NaiveLSTMfn.apply
             case "persistent":
                 fn = PersistentLSTMfn.apply
             case "graph":
                 fn = GraphLSTMfn.apply
-            case "fast":
-                fn = LSTMfn.apply
+            case "naive-pt":
+                fn = NaiveLSTMfn.apply
             case "v1":
                 fn = V1LSTMfn.apply
             case _:
@@ -815,18 +698,56 @@ class FastLSTM(nn.Module):
         return x, (torch.stack(h_n), torch.stack(c_n))
 
 
+class FlashLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, backend, dtype=None, device="cuda"):
+        super().__init__()
+        self.gate_in = nn.Linear(
+            input_size, 4 * hidden_size, dtype=dtype, device=device, bias=False
+        )
+        sqrt_k_inv = 1 / hidden_size**0.5
+        self.R = nn.Parameter(
+            torch.randn([4, 1, hidden_size, hidden_size], device=device, dtype=dtype)
+            * 2
+            * sqrt_k_inv
+            - sqrt_k_inv
+        )
+        self.b = nn.Parameter(
+            torch.randn([4, 1, hidden_size], device=device, dtype=dtype)
+            * 2
+            * sqrt_k_inv
+            - sqrt_k_inv
+        )
+        self.hidden_size = hidden_size
+        self.backend = backend
+        self.dtype = {
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }[dtype]
+
+    def forward(self, x):
+        R = self.R
+        # convert to batch_first
+        Wx = self.gate_in(x.transpose(0, 1))
+        Wx = Wx.reshape(Wx.shape[0], Wx.shape[1], R.shape[0], R.shape[1], R.shape[2])
+
+        h_frnn, hlast_frnn = flashrnn(
+            Wx=Wx,
+            R=R,
+            b=self.b,
+            states=None,
+            function="lstm",
+            backend=self.backend,
+            dtype=self.dtype,
+        )
+
+        return h_frnn[0].transpose(0, 1).squeeze(-2), hlast_frnn
+
+
 #######################################################################################
 ################# versions below were experimental and aren't performant ##############
 #######################################################################################
-def lstm_v1_fwd(
-    x,
-    h0,
-    c0,
-    Wx,
-    bx,
-    Wh,
-    bh,
-):
+def lstm_v1_fwd(x, h0, c0, Wx, bx, Wh, bh):
     if x.dim() == 2:
         x = x[None]
 
@@ -968,7 +889,7 @@ def lstm_v1_bwd(dh, dc_n, dh_n, x, h, cell, ifgo, Wx, Wh, mode=2):
 
         if mode == 0:
             kernels.matmul_v2(d_ifgo, Wh, dh_n)
-            kernels.matmul_v2(d_ifgo, Wx, d_x[s])  # s refers to the offset
+            kernels.matmul_v2(d_ifgo, Wx, d_x[offset.item()])
         elif mode == 1:
             kernels.my_matmul_kernel[DgradGrid1](
                 a_ptr=d_ifgo,

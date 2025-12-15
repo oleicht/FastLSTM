@@ -45,7 +45,7 @@ def run_overfit(
 
 if __name__ == "__main__":
     df = run_overfit(
-        ["fast", "lstm", "persistent", "graph"],
+        ["lstm", "persistent", "graph"],
         precision=[None, torch.float16, torch.bfloat16][0],
     )
     df.to_parquet("bf16_losses.parquet")

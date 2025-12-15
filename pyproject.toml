@@ -8,6 +8,7 @@ authors = [
     { name = "Oliver Leicht", email = "oliverleicht@gmx.de" }
 ]
 dependencies = [
+    "flashrnn>=1.0.4",
     "ipython>=9.6.0",
     "jaxtyping>=0.3.3",
     "jupyter>=1.1.1",
