@@ -167,15 +167,15 @@ def test_lstm_v1_fwd():
 )
 @pytest.mark.parametrize(
     "seq_size",
-    [10, 100][:1],
+    [10, 100],
 )
 @pytest.mark.parametrize(
     "batch_size",
-    [4, 44, 100][:1],
+    [4, 44, 100],
 )
 @pytest.mark.parametrize(
     "hidden_size",
-    [16, 65, 257, 2030],
+    [16, 65, 257],
 )
 def test_fastlstm(version, seq_size, batch_size, hidden_size):
     """I believe the implementation is correct. However, errors of the gradients

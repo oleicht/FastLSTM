@@ -4,6 +4,7 @@ from importlib import reload
 import math
 
 import torch
+from torch.amp import custom_fwd, custom_bwd
 import torch.nn as nn
 import triton
 
@@ -100,7 +101,6 @@ def lstm_persistent_fwd(x, h0, c0, Wx, bx, Wh, bh, version=None):
 
     torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_push("run kernel")
-
     match version:
         case 1:
             kernel = kernels.persistent_fwd_kernel
@@ -503,7 +503,18 @@ def Wgrad(d_ifgo, x, h):
 
 class PersistentLSTMfn(torch.autograd.Function):
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(ctx, x, h_0, c_0, Wx, bx, Wh, bh):
+        torch.cuda.nvtx.range_push("persistent amp")
+        if torch.is_autocast_enabled():
+            target = torch.get_autocast_dtype("cuda")
+            x = x.to(target)
+            Wx = Wx.to(target)
+            Wh = Wh.to(target)
+            bx = bx.to(target)
+            bh = bh.to(target)
+        torch.cuda.nvtx.range_pop()
+
         out, cell, ifgo = lstm_persistent_fwd(x, h_0, c_0, Wx, bx, Wh, bh)
         ctx.h0_is_nan = h_0 is None
         ctx.save_for_backward(x, out, cell, ifgo, Wx, Wh)
@@ -511,6 +522,7 @@ class PersistentLSTMfn(torch.autograd.Function):
         return out[1:], (out[-1], cell[-1])
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dh, d_out_cell):
         x, out, cell, ifgo, Wx, Wh = ctx.saved_tensors
         if d_out_cell is None:
@@ -528,7 +540,18 @@ class PersistentLSTMfn(torch.autograd.Function):
 
 class GraphLSTMfn(torch.autograd.Function):
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(ctx, x, h_0, c_0, Wx, bx, Wh, bh):
+        torch.cuda.nvtx.range_push("graph_amp")
+        if torch.is_autocast_enabled():
+            target = torch.get_autocast_dtype("cuda")
+            x = x.to(target)
+            Wx = Wx.to(target)
+            Wh = Wh.to(target)
+            bx = bx.to(target)
+            bh = bh.to(target)
+        torch.cuda.nvtx.range_pop()
+
         torch.cuda.nvtx.range_push("graph_fwd")
         out, cell, ifgo = lstm_graph_fwd(x, h_0, c_0, Wx, bx, Wh, bh)
         ctx.save_for_backward(x, out, cell, ifgo, Wx, Wh)
@@ -538,6 +561,7 @@ class GraphLSTMfn(torch.autograd.Function):
         return out, (out[-1], cell[-1])
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, dh, d_out_cell):
         torch.cuda.nvtx.range_push("graph_bwd")
         x, out, cell, ifgo, Wx, Wh = ctx.saved_tensors
